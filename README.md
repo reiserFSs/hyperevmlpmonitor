@@ -33,9 +33,9 @@ You should then see the following screen upon loading the script for the first t
 ```
 ╔══════════════════════════════════════════════════════════════╗
 ║                 💧 HYPEREVM LP MONITOR                       ║
-║                  Multi-DEX Position Tracker                 ║
-║                    v1.4.1 by 8roku8.hl                      ║
-║              (Modular + Fee Tracking)                       ║
+║                  Multi-DEX Position Tracker                  ║
+║                    v1.4.1 by 8roku8.hl                       ║
+║              (Modular + Fee Tracking)                        ║
 ╚══════════════════════════════════════════════════════════════╝
 
 🔧 Loading configuration...
