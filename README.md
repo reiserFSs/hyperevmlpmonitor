@@ -1,5 +1,7 @@
 # About
-A concentraded liquidity pool monitor that tracks positions across multiple DEXes on HyperEVM. Completely vibe coded with Claude Sonnet 4, so expect bugs and report them on Discord / open issues on Git.
+A concentraded liquidity pool monitor that tracks positions across multiple DEXes on HyperEVM. Completely vibe coded with Claude Sonnet 4, so expect bugs and report them on Discord / open issues on Git.##
+
+The main features of this monitor is essentially the notification feature. Let the script run on your VPS / Raspberry Pi and get notifications on the go or when you're not at your desk when positions go out of range etc.
 
 # Features
 - Dynamic position tracking (auto-detects new/removed positions)
