@@ -12,7 +12,7 @@ The main features of this monitor is essentially the notification feature. Let t
 - Modular architecture for maintainability
 
 # Installation
-Git clone this repository or download the files as a zip from Git and extract them into a new folder.
+Git clone this repository or download the files as a zip from Git and extract them into a new folder. Installation for Windows should be similar if you have Python3 installed. Would recommend using the Git Bash terminal for Windows.
 
 ```
 git clone https://github.com/reiserFSs/hyperevmlpmonitor
