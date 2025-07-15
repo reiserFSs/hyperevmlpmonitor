@@ -59,7 +59,30 @@ Let's set up your LP monitor. You can modify these settings later in lp_monitor_
 3. Full colors (original colorful interface)
 Choose color scheme (1-3, default: 1):
 ```
-Proceed with the first time setup as outlined by the terminal output. It'll ask you for the contract address of the NonfungiblePositionManager of each dex you're configuring. These are usually found in the docs, or just pull them from HyperEVMScan. 
+Proceed with the first time setup as outlined by the terminal output. It'll ask you for the contract address of the NonfungiblePositionManager of each dex you're configuring. These are usually found in the docs, or just pull them from HyperEVMScan, but here are some of the common ones: 
+
+For Hybra Finance:
+```
+0x934C4f47B2D3FfcA0156A45DEb3A436202aF1efa
+```
+For Kittenswap:
+```
+0xB9201e89f94a01FF13AD4CAeCF43a2e232513754
+```
+For Gliquid:
+```
+0x69D57B9D705eaD73a5d2f2476C30c55bD755cc2F
+```
+For Hyperswap
+```
+0x6eDA206207c09e5428F281761DdC0D300851fBC8
+```
+
+For Laminar
+```
+0xfdf8b1f915198ed043ee52ec367c3df8ed5c9d79
+```
+The script will pull the correct factory address from the NFTPositionManager. 
 
 # Troubleshooting
 
