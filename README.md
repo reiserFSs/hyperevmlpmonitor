@@ -14,18 +14,19 @@ The main features of this monitor is essentially the notification feature. Let t
 # Installation
 Git clone this repository or download the release from Git and extract it into a new folder. Installation for Windows should be similar if you have Python3 installed. Would recommend using the Git Bash terminal for Windows.
 
+Clone into the repository (If using the Release instead, this step is not needed.)
 ```
 git clone https://github.com/reiserFSs/hyperevmlpmonitor
 ```
-
+Change directory
 ```
 cd hyperevmlpmonitor
 ```
-
+Install Python dependencies
 ```
 pip3 install -r requirements.txt
 ```
-
+Run the script
 ```
 python3 main.py
 ```
