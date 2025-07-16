@@ -84,6 +84,9 @@ For Laminar
 ```
 The script will pull the correct factory address from the NFTPositionManager. 
 
+# Notification Example
+<img width="370" height="360" alt="image" src="https://github.com/user-attachments/assets/a971cba4-d817-4223-9641-b3b440d7f5a8" />
+
 # Troubleshooting
 
 For troubleshooting, please enable debug mode in ```lp_monitor_config.json``` 
