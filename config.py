@@ -11,6 +11,7 @@ Developer: 8roku8.hl
 
 import json
 import os
+import copy
 from constants import DEFAULT_CONFIG, CONFIG_FILE
 from display import get_color_scheme_from_user
 from utils import validate_dex_configs
@@ -94,7 +95,8 @@ def setup_first_run():
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
     
-    config = DEFAULT_CONFIG.copy()
+    # Use deep copy to avoid mutating DEFAULT_CONFIG's nested structures
+    config = copy.deepcopy(DEFAULT_CONFIG)
     
     print(f"Let's set up your LP monitor. You can modify these settings later in {CONFIG_FILE}\n")
     
