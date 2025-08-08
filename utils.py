@@ -203,8 +203,7 @@ def format_price(price):
 def is_full_range_position(tick_lower, tick_upper):
     """Detect if a position is full-range or near full-range"""
     # Uniswap V3/Algebra tick limits are approximately ±887,272
-    # Consider positions within 10,000 ticks of the limits as "full range"
-    TICK_LIMIT = 877272  # Slightly below actual limit for safety
+    TICK_LIMIT = 887272  # Use actual limit for detection
     
     return (tick_lower <= -TICK_LIMIT and tick_upper >= TICK_LIMIT) or (tick_upper - tick_lower) > 1700000
 
