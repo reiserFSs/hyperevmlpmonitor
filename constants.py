@@ -3,14 +3,14 @@
 Constants Module for HyperEVM LP Monitor
 Contains all ABIs, default configuration, and constant values
 
-UPDATED VERSION: Smart notification defaults with per-position cooldowns + Fee Tracking
+UPDATED VERSION: Smart notification defaults with per-position cooldowns + Fee Tracking + Rich UI
 
-Version: 1.4.1 (Smart Notifications + Fee Tracking)
-Developer: 8roku8.hl
+Version: 1.5.0 (Smart Notifications + Fee Tracking + Rich UI)
+Developer: 8roku8.hl + Claude
 """
 
 # Version and metadata
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 DEVELOPER = "8roku8.hl" 
 CONFIG_FILE = "lp_monitor_config.json"
 
@@ -29,7 +29,7 @@ KNOWN_TOKENS = {
     # "0x...": "USDT", 
 }
 
-# Default configuration with smart notification system + fee tracking
+# Default configuration with smart notification system + fee tracking + Rich UI
 DEFAULT_CONFIG = {
     "version": VERSION,
     "wallet_address": "",
@@ -42,13 +42,21 @@ DEFAULT_CONFIG = {
         "enable_dynamic": True
     },
     "display_settings": {
+        # Rich UI settings (NEW)
+        "use_rich_ui": True,              # Enable Rich terminal UI
+        "compact_mode": False,            # Compact display mode
+        "table_style": "rounded",         # Table border style: rounded, simple, double
+        "refresh_animation": True,        # Show loading animations
+        "show_sparklines": True,          # Show mini charts in Rich UI (future feature)
+        
+        # Existing display settings
         "clear_screen": True,
-        "color_scheme": "minimal",        # "full", "minimal", or "none"
+        "color_scheme": "rich",           # "rich", "minimal", or "none"
         "debug_mode": False,
-        "show_theoretical_amounts": True,  # Show what amounts would be if in range
-        "show_raw_data": False,  # Show raw blockchain data for debugging
-        "show_unclaimed_fees": True,  # Show unclaimed fees
-        "fee_value_threshold": 0.01  # Only show fees above this USD value
+        "show_theoretical_amounts": True, # Show what amounts would be if in range
+        "show_raw_data": False,          # Show raw blockchain data for debugging
+        "show_unclaimed_fees": True,     # Show unclaimed fees
+        "fee_value_threshold": 0.01      # Only show fees above this USD value
     },
     "notifications": {
         "enabled": False,
@@ -81,6 +89,43 @@ DEFAULT_CONFIG = {
             "email_password": "",
             "recipient_email": ""
         }
+    }
+}
+
+# Table styles for Rich UI
+TABLE_STYLES = {
+    "rounded": "ROUNDED",
+    "simple": "SIMPLE",
+    "double": "DOUBLE_EDGE",
+    "heavy": "HEAVY",
+    "minimal": "MINIMAL"
+}
+
+# Color themes for Rich UI
+RICH_THEMES = {
+    "default": {
+        "header": "bold cyan",
+        "success": "green",
+        "warning": "yellow",
+        "danger": "red",
+        "info": "blue",
+        "muted": "dim white"
+    },
+    "dark": {
+        "header": "bold bright_cyan",
+        "success": "bright_green",
+        "warning": "bright_yellow",
+        "danger": "bright_red",
+        "info": "bright_blue",
+        "muted": "dim"
+    },
+    "light": {
+        "header": "bold blue",
+        "success": "green",
+        "warning": "yellow",
+        "danger": "red",
+        "info": "cyan",
+        "muted": "dim black"
     }
 }
 

@@ -35,6 +35,7 @@ class NotificationManager:
         self.last_notification_time = 0
         self.email_password = None
         self.include_fees = config.get("notifications", {}).get("include_fees_in_notifications", True)
+        self.include_il = config.get("notifications", {}).get("include_il_in_notifications", True)
         
         # Per-position state tracking for smart cooldowns
         self.position_states_file = "position_notification_states.json"
@@ -537,6 +538,24 @@ class NotificationManager:
             else:
                 details["fees"] = "No significant fees"
         
+        # Add IL information if enabled and available
+        if self.include_il and "il_data" in status:
+            il_data = status["il_data"]
+            rebalance_rec = status.get("rebalance_recommendation", {})
+            
+            if not il_data.get("is_full_range", False):
+                il_pct = il_data.get("il_percentage", 0)
+                efficiency = rebalance_rec.get("efficiency_score", 0)
+                urgency = rebalance_rec.get("urgency", "none")
+                
+                details["il_analysis"] = f"{il_pct:.1f}% vs HODL"
+                details["efficiency"] = f"{efficiency:.0f}/100"
+                
+                if rebalance_rec.get("should_rebalance", False):
+                    details["rebalance_needed"] = f"{urgency.upper()} priority"
+                else:
+                    details["rebalance_needed"] = "Not needed"
+        
         if is_full_range:
             details["range_info"] = "Full Range (No limits)"
             details["buffer_info"] = "Always earning fees"
@@ -670,6 +689,11 @@ class NotificationManager:
                 # Add fee information if available
                 if self.include_fees and "fees" in details:
                     message_parts.append(f"    💸 Fees: {details['fees']}")
+                # Add IL information if available
+                if self.include_il and "il_analysis" in details:
+                    message_parts.append(f"    📊 IL: {details['il_analysis']}")
+                    message_parts.append(f"    🎯 Efficiency: {details['efficiency']}")
+                    message_parts.append(f"    🔄 Rebalance: {details['rebalance_needed']}")
                 message_parts.append("")
             
             # Show summary for remaining positions
@@ -693,6 +717,10 @@ class NotificationManager:
                     # Add fee information if available
                     if self.include_fees and "fees" in details:
                         message_parts.append(f"    💸 Fees: {details['fees']}")
+                    # Add IL information if available
+                    if self.include_il and "il_analysis" in details:
+                        message_parts.append(f"    📊 IL: {details['il_analysis']}")
+                        message_parts.append(f"    🎯 Efficiency: {details['efficiency']}")
                     message_parts.append("")
             else:
                 message_parts.append(f"<b>✅ {len(safe_positions)} safe positions updated</b>")
@@ -747,6 +775,11 @@ class NotificationManager:
                 # Add fee information if available
                 if self.include_fees and "fees" in details:
                     message_parts.append(f"    Fees: {details['fees']}")
+                # Add IL information if available
+                if self.include_il and "il_analysis" in details:
+                    message_parts.append(f"    IL: {details['il_analysis']}")
+                    message_parts.append(f"    Efficiency: {details['efficiency']}")
+                    message_parts.append(f"    Rebalance: {details['rebalance_needed']}")
                 message_parts.append("")
             
             # Show summary for remaining positions
@@ -770,6 +803,10 @@ class NotificationManager:
                     # Add fee information if available
                     if self.include_fees and "fees" in details:
                         message_parts.append(f"    Fees: {details['fees']}")
+                    # Add IL information if available
+                    if self.include_il and "il_analysis" in details:
+                        message_parts.append(f"    IL: {details['il_analysis']}")
+                        message_parts.append(f"    Efficiency: {details['efficiency']}")
                     message_parts.append("")
             else:
                 message_parts.append(f"✅ {len(safe_positions)} safe positions updated")
