@@ -29,7 +29,7 @@ KNOWN_TOKENS = {
     # "0x...": "USDT", 
 }
 
-# Default configuration with smart notification system + fee tracking + Rich UI
+# Default configuration with smart notification system + fee tracking + Rich UI + PnL/IL
 DEFAULT_CONFIG = {
     "version": VERSION,
     "wallet_address": "",
@@ -58,12 +58,19 @@ DEFAULT_CONFIG = {
         "show_unclaimed_fees": True,     # Show unclaimed fees
         "fee_value_threshold": 0.01      # Only show fees above this USD value
     },
+    # PnL/IL tracking settings (uses a local SQLite DB)
+    "pnl_settings": {
+        "enabled": True,
+        "database_path": "lp_positions.db",
+        "include_il_metrics": True
+    },
     "notifications": {
         "enabled": False,
-        "type": "telegram",  # telegram, discord, pushover, email
+        "type": "telegram",  # telegram, discord
         "notification_cooldown": 900,  # 15 minutes global cooldown (reduced from 1 hour)
         "notify_on_issues_only": False,   # Smart notifications work well for all updates
         "include_fees_in_notifications": True,  # Include fee information in notifications
+        "include_il_in_notifications": True,    # Include IL metrics where available
         "smart_cooldowns": {
             "status_change": 0,          # Immediate notification for any status change
             "same_out_of_range": 30 * 60,  # 30 min for repeated out-of-range
@@ -77,17 +84,6 @@ DEFAULT_CONFIG = {
         },
         "discord": {
             "webhook_url": ""
-        },
-        "pushover": {
-            "user_key": "",
-            "api_token": ""
-        },
-        "email": {
-            "smtp_server": "smtp.gmail.com",
-            "smtp_port": 587,
-            "email_address": "",
-            "email_password": "",
-            "recipient_email": ""
         }
     }
 }

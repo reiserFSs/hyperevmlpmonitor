@@ -35,7 +35,7 @@ class BlockchainManager:
         if not self.w3.is_connected():
             raise Exception("Failed to connect to HyperEVM blockchain")
         
-        print(f"✅ Connected to HyperEVM")
+        print("Connected to HyperEVM")
 
     def get_enhanced_token_info(self, token_address, dex_name=""):
         """Enhanced token info with better symbol detection and mapping"""
@@ -349,7 +349,8 @@ class BlockchainManager:
             try:
                 # This will fail if not Algebra
                 test_call = factory_contract.functions.poolByPair
-                print(f"🔍 Auto-detected: {dex_name} uses Algebra Integral")
+                if self.debug_mode:
+                    print(f"Auto-detected: {dex_name} uses Algebra Integral")
                 return "algebra_integral"
             except:
                 pass
@@ -357,7 +358,8 @@ class BlockchainManager:
             pass
         
         # Default to Uniswap V3
-        print(f"🔍 Auto-detected: {dex_name} uses Uniswap V3")
+        if self.debug_mode:
+            print(f"Auto-detected: {dex_name} uses Uniswap V3")
         return "uniswap_v3"
 
     def get_pool_address(self, token0, token1, fee, factory_address, dex_type="uniswap_v3"):
@@ -387,20 +389,21 @@ class BlockchainManager:
                 pool_address = factory_contract.functions.getPool(token0, token1, fee).call()
             
             if pool_address == "0x0000000000000000000000000000000000000000":
-                print(f"⚠️  No pool found for tokens {token0[:6]}.../{token1[:6]}... (type: {dex_type})")
+                print(f"No pool found for tokens {token0[:6]}.../{token1[:6]}... (type: {dex_type})")
                 return None
                 
             return pool_address
             
         except Exception as e:
-            print(f"⚠️  Error getting pool address ({dex_type}): {e}")
+            print(f"Error getting pool address ({dex_type}): {e}")
             # If Algebra fails, try Uniswap V3 as fallback
             if dex_type == "algebra_integral":
-                print(f"🔄 Falling back to Uniswap V3 method...")
+                if self.debug_mode:
+                    print("Falling back to Uniswap V3 method...")
                 return self.get_pool_address(token0, token1, fee, factory_address, "uniswap_v3")
             return None
 
-    def fetch_positions_from_dex(self, wallet_address, dex_config):
+    def fetch_positions_from_dex(self, wallet_address, dex_config, silent=False):
         """Fetch LP positions from a specific DEX with fee tracking"""
         dex_name = dex_config["name"]
         position_manager_address = dex_config["position_manager"]
@@ -408,7 +411,8 @@ class BlockchainManager:
         
         positions = []
         
-        print(f"\n🏪 Checking {dex_name} ({dex_type})...")
+        if not silent:
+            print(f"\nChecking {dex_name} ({dex_type})...")
         
         try:
             position_manager = self.w3.eth.contract(
@@ -420,7 +424,8 @@ class BlockchainManager:
             factory_address = None
             try:
                 factory_address = position_manager.functions.factory().call()
-                print(f"🏭 {dex_name} Factory: {factory_address}")
+                if self.debug_mode and not silent:
+                    print(f"Factory: {factory_address}")
                 
                 # Auto-detect DEX type if not specified
                 if dex_type == "uniswap_v3" and dex_name.lower() in ["gliquid", "quickswap"]:
@@ -434,14 +439,15 @@ class BlockchainManager:
             
             # Get number of positions owned by wallet
             balance = position_manager.functions.balanceOf(wallet_address).call()
-            print(f"📋 Found {balance} LP NFT(s) in {dex_name}")
+            if not silent:
+                print(f"Found {balance} LP NFT(s) in {dex_name}")
             
             if balance == 0:
                 return positions
             
             # Show progress for large numbers of positions
-            if balance > 10:
-                print(f"⏳ Scanning {balance} positions (this may take a moment)...")
+            if balance > 10 and not silent:
+                print(f"Scanning {balance} positions (this may take a moment)...")
             
             positions_added = 0
             positions_skipped = 0
@@ -451,7 +457,8 @@ class BlockchainManager:
                 try:
                     # Show progress for large scans
                     if balance > 20 and (i + 1) % 10 == 0:
-                        print(f"📊 Progress: {i + 1}/{balance} positions scanned...")
+                        if not silent:
+                            print(f"Progress: {i + 1}/{balance} positions scanned...")
                     
                     # Get token ID
                     token_id = position_manager.functions.tokenOfOwnerByIndex(wallet_address, i).call()
@@ -465,8 +472,8 @@ class BlockchainManager:
                     # FAST CHECK: Skip positions with no liquidity BEFORE expensive operations
                     if liquidity == 0:
                         positions_skipped += 1
-                        # Only show detailed skipping info if balance is small
-                        if balance <= 20:
+                        # Only show detailed skipping info in debug mode to avoid clutter
+                        if self.debug_mode and balance <= 20 and not silent:
                             print(f"⚠️  {dex_name} position #{token_id} has no liquidity, skipping")
                         continue
                     
@@ -507,17 +514,18 @@ class BlockchainManager:
                     
                     positions.append(position)
                     positions_added += 1
-                    print(f"✅ Added {dex_name}: {position['name']} (Token ID: {token_id})")
+                    if self.debug_mode and not silent:
+                        print(f"Added {dex_name}: {position['name']} (Token ID: {token_id})")
                     
                 except Exception as e:
-                    print(f"❌ Error fetching {dex_name} position {i}: {e}")
+                    print(f"Error fetching {dex_name} position {i}: {e}")
                     if self.debug_mode:
                         import traceback
                         traceback.print_exc()
             
-            # Show DEX summary
-            if positions_skipped > 0:
-                print(f"📊 {dex_name} Summary: {positions_added} active, {positions_skipped} empty positions skipped")
+            # Show DEX summary (always show a compact summary to replace per-position logs)
+            if not silent:
+                print(f"Summary: {positions_added} active, {positions_skipped} empty positions skipped")
                     
         except Exception as e:
             print(f"❌ Error accessing {dex_name} position manager: {e}")

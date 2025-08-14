@@ -68,7 +68,7 @@ class RichDisplayManager:
     def create_header_panel(self):
         """Create a stylized header panel"""
         header_text = Text()
-        header_text.append("💧 HYPEREVM LP MONITOR\n", style="bold cyan")
+        header_text.append("HYPEREVM LP MONITOR\n", style="bold cyan")
         header_text.append(f"Multi-DEX Position Tracker v{VERSION}\n", style="bright_white")
         header_text.append(f"by {DEVELOPER}", style="italic dim")
         
@@ -89,7 +89,7 @@ class RichDisplayManager:
             show_value_column = bool(token_prices)
         
         table = Table(
-            title="🏊 LP Positions & Performance",
+            title="LP Positions & Performance",
             box=box.ROUNDED,
             show_header=True,
             header_style="bold magenta",
@@ -101,7 +101,7 @@ class RichDisplayManager:
         table.add_column("DEX", style="cyan", width=11)
         table.add_column("Pair", style="yellow", width=16)
         table.add_column("Status", justify="center", width=12)
-        table.add_column("Range", justify="center", width=17)
+        table.add_column("Range", justify="center", width=18)
         
         if show_value_column:
             table.add_column("Value", justify="right", style="white")
@@ -272,36 +272,60 @@ class RichDisplayManager:
         return table
     
     def create_compact_range_bar(self, lower_tick, upper_tick, current_tick, in_range):
-        """Create a compact visual range bar"""
+        """Create a compact visual range bar centered at mid-range.
+
+        The pointer starts in the center and moves left (toward lower bound) or
+        right (toward upper bound). Shows a signed percentage offset from center.
+        """
         if is_full_range_position(lower_tick, upper_tick):
             return Text("[FULL]", style="bold cyan")
-        
-        bar_length = 12  # Reduced from 15 for more space
+
+        bar_length = 11  # odd length so there is a true center cell
+        center_index = bar_length // 2
         range_size = upper_tick - lower_tick
-        
-        if in_range:
-            position = (current_tick - lower_tick) / range_size
-            position = max(0, min(1, position))
-            filled = int(position * bar_length)
-            
-            bar_text = Text()
-            bar_text.append("[")
-            
-            for i in range(bar_length):
-                if i < filled:
-                    bar_text.append("█", style="green")
-                elif i == filled:
-                    bar_text.append("▓", style="yellow")
-                else:
-                    bar_text.append("░", style="dim white")
-            
-            bar_text.append(f"]{position*100:3.0f}%", style="dim")
-            return bar_text
-        else:
+
+        # Out of range indicators remain explicit
+        if not in_range:
             if current_tick < lower_tick:
-                return Text("◄─[    ]", style="red")
+                return Text("<[     ]", style="red")
             else:
-                return Text("[    ]─►", style="red")
+                return Text("[     ]>", style="red")
+
+        # Compute normalized offset relative to the midpoint (-1.0 .. 1.0)
+        mid_tick = (lower_tick + upper_tick) / 2
+        half_span = max(1, range_size / 2)
+        normalized = (current_tick - mid_tick) / half_span
+        if normalized < -1:
+            normalized = -1
+        elif normalized > 1:
+            normalized = 1
+
+        # Map normalized offset to a pointer index on the bar
+        pointer_index = int(round(center_index + normalized * center_index))
+        pointer_index = max(0, min(bar_length - 1, pointer_index))
+
+        bar_text = Text()
+        bar_text.append("[")
+
+        for i in range(bar_length):
+            # Center marker, unless the pointer sits exactly on it
+            if i == center_index and i != pointer_index:
+                bar_text.append("│", style="dim white")
+                continue
+
+            if i == pointer_index:
+                bar_text.append("▓", style="yellow")
+            elif (pointer_index > center_index and center_index < i < pointer_index) or \
+                 (pointer_index < center_index and pointer_index < i < center_index):
+                bar_text.append("█", style="green")
+            else:
+                bar_text.append("░", style="dim white")
+
+        # Append signed percentage offset from center with fixed width to keep centering consistent
+        offset_pct = normalized * 100
+        bar_text.append("]", style="dim")
+        bar_text.append(f" {offset_pct:+4.0f}%", style="dim")
+        return bar_text
     
     def get_compact_risk_badge(self, position, status):
         """Get compact risk badge"""
@@ -395,7 +419,7 @@ class RichDisplayManager:
         return Panel(summary_text, title="Performance", border_style="green", box=box.ROUNDED)
     
     def create_dashboard_layout_with_pnl(self, positions_with_status, wallet_address, 
-                                         refresh_countdown=None, notification_sent=False):
+                                         refresh_countdown=None, notification_sent=False, refresh_cycle=None, is_refreshing=False):
         """Create dashboard layout with PnL metrics and status messages"""
         layout = Layout()
         
@@ -422,9 +446,24 @@ class RichDisplayManager:
         footer_text = Text()
         footer_text.append(f"Last Update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", style="dim")
         
+        # Always show refresh cycle if provided (e.g., 3/20)
+        if refresh_cycle and isinstance(refresh_cycle, tuple) and len(refresh_cycle) == 2:
+            current_cycle, total_cycles = refresh_cycle
+            try:
+                current_cycle_int = int(current_cycle)
+                total_cycles_int = int(total_cycles)
+                footer_text.append(f" | 🔁 Refresh {current_cycle_int}/{total_cycles_int}", style="cyan")
+            except Exception:
+                # If casting fails, skip gracefully
+                pass
+        
         # Add refresh countdown if provided
         if refresh_countdown is not None and refresh_countdown > 0:
             footer_text.append(f" | Refresh in {refresh_countdown} cycles", style="yellow")
+        
+        # Background refresh hint
+        if is_refreshing:
+            footer_text.append(" | Scanning for new/removed positions...", style="cyan")
         
         # Add notification status if sent
         if notification_sent:
@@ -469,13 +508,15 @@ class RichDisplayManager:
         return Panel(stats_text, title="Stats", border_style="green", box=box.ROUNDED)
     
     def print_live_dashboard(self, positions_with_status, wallet_address, 
-                           refresh_countdown=None, notification_sent=False):
+                           refresh_countdown=None, notification_sent=False, refresh_cycle=None, is_refreshing=False):
         """Print the live updating dashboard with PnL and status messages"""
         layout = self.create_dashboard_layout_with_pnl(
             positions_with_status, 
             wallet_address,
             refresh_countdown=refresh_countdown,
-            notification_sent=notification_sent
+            notification_sent=notification_sent,
+            refresh_cycle=refresh_cycle,
+            is_refreshing=is_refreshing
         )
         self.console.print(layout)
 
@@ -517,18 +558,27 @@ class EnhancedDisplayManager:
             print(f"{self.c('end')}")
     
     def display_positions(self, positions_with_status, wallet_address, 
-                        refresh_countdown=None, notification_sent=False):
+                        refresh_countdown=None, notification_sent=False, refresh_cycle=None, is_refreshing=False):
         """Display all positions with PnL metrics and status messages"""
         if self.use_rich:
             self.rich_display.print_live_dashboard(
                 positions_with_status, 
                 wallet_address,
                 refresh_countdown=refresh_countdown,
-                notification_sent=notification_sent
+                notification_sent=notification_sent,
+                refresh_cycle=refresh_cycle,
+                is_refreshing=is_refreshing
             )
         else:
             self.display_positions_simple(positions_with_status)
             # Show status messages in simple mode too
+            if refresh_cycle and isinstance(refresh_cycle, tuple) and len(refresh_cycle) == 2:
+                try:
+                    current_cycle_int = int(refresh_cycle[0])
+                    total_cycles_int = int(refresh_cycle[1])
+                    print(f"🔁 Refresh {current_cycle_int}/{total_cycles_int}")
+                except Exception:
+                    pass
             if refresh_countdown is not None and refresh_countdown > 0:
                 print(f"⏰ Position refresh in {refresh_countdown} cycles")
             if notification_sent:

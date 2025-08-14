@@ -74,6 +74,9 @@ class EnhancedLPMonitor:
         self.debug_mode = debug_mode
         self.show_raw_data = config.get("display_settings", {}).get("show_raw_data", False)
         self.show_fees = config.get("display_settings", {}).get("show_unclaimed_fees", True)
+        # PnL/IL toggles from config
+        self.pnl_enabled = config.get("pnl_settings", {}).get("enabled", True)
+        self.include_il_metrics = config.get("pnl_settings", {}).get("include_il_metrics", True)
         
         # Display configuration info
         self.print_initial_info()
@@ -82,10 +85,10 @@ class EnhancedLPMonitor:
         self.fetch_all_positions_with_progress()
         
         if self.use_rich:
-            console.print(f"[green]📊 Found {len(self.positions)} LP positions total[/green]")
+            console.print(f"[green]Found {len(self.positions)} LP positions total[/green]")
             console.rule(style="blue")
         else:
-            print(f"📊 Found {len(self.positions)} LP positions total")
+            print(f"Found {len(self.positions)} LP positions total")
             print("=" * 70)
 
     def print_initial_info(self):
@@ -94,38 +97,38 @@ class EnhancedLPMonitor:
         dexes = self.config["dexes"]
         
         if self.use_rich:
-            console.print(f"[white]👛 Monitoring wallet:[/white] [bold cyan]{wallet}[/bold cyan]")
+            console.print(f"[white]Monitoring wallet:[/white] [bold cyan]{wallet}[/bold cyan]")
             
             # Show configured DEXes
             dex_info_list = [f"{dex['name']} ({dex.get('type', 'uniswap_v3')})" for dex in dexes]
             dex_info_str = ', '.join(dex_info_list)
-            console.print(f"[white]🏪 Configured DEXes:[/white] [bold]{dex_info_str}[/bold]")
+            console.print(f"[white]Configured DEXes:[/white] [bold]{dex_info_str}[/bold]")
             
             # Show notification status
             if self.notifications.enabled:
                 notify_issues_only = self.config.get("notifications", {}).get("notify_on_issues_only", True)
                 cooldown_hours = self.config.get("notifications", {}).get("notification_cooldown", 3600) / 3600
                 status = "Issues only" if notify_issues_only else "All updates"
-                console.print(f"[white]🔔 Notifications:[/white] [green]{self.notifications.notification_type}[/green] - {status}, every {cooldown_hours:.1f}h")
+                console.print(f"[white]Notifications:[/white] [green]{self.notifications.notification_type}[/green] - {status}, every {cooldown_hours:.1f}h")
             
             # Show fee tracking status
             if self.show_fees:
-                console.print(f"[white]💰 Fee tracking:[/white] [green]Enabled[/green]")
+                console.print(f"[white]Fee tracking:[/white] [green]Enabled[/green]")
             
             # Show PnL tracking status
-            console.print(f"[white]📊 PnL/IL tracking:[/white] [green]Enabled[/green]")
+            console.print(f"[white]PnL/IL tracking:[/white] [green]Enabled[/green]")
             
             if self.debug_mode:
-                console.print(f"[yellow]🔍 Debug mode enabled[/yellow]")
+                console.print(f"[yellow]Debug mode enabled[/yellow]")
             
             # Show dynamic thresholds
             dynamic_config = self.config.get('dynamic_thresholds', {})
-            console.print(f"[white]🎯 Dynamic thresholds:[/white] [red]{dynamic_config.get('danger_threshold_pct', 5.0)}%[/red] danger, [yellow]{dynamic_config.get('warning_threshold_pct', 15.0)}%[/yellow] warning")
+            console.print(f"[white]Dynamic thresholds:[/white] [red]{dynamic_config.get('danger_threshold_pct', 5.0)}%[/red] danger, [yellow]{dynamic_config.get('warning_threshold_pct', 15.0)}%[/yellow] warning")
         else:
             # Fallback to simple printing
-            print(f"👛 Monitoring wallet: {wallet}")
+            print(f"Monitoring wallet: {wallet}")
             dex_info_list = [f"{dex['name']} ({dex.get('type', 'uniswap_v3')})" for dex in dexes]
-            print(f"🏪 Configured DEXes: {', '.join(dex_info_list)}")
+            print(f"Configured DEXes: {', '.join(dex_info_list)}")
 
     def fetch_all_positions_with_progress(self):
         """Fetch positions from all DEXes with progress indicator"""
@@ -154,7 +157,7 @@ class EnhancedLPMonitor:
                     total_positions += len(positions)
                     progress.advance(task)
         else:
-            print("🔍 Fetching LP positions from all DEXes...")
+            print("Fetching LP positions from all DEXes...")
             for dex_config in self.config["dexes"]:
                 positions = self.blockchain.fetch_positions_from_dex(wallet_address, dex_config)
                 self.positions.extend(positions)
@@ -170,11 +173,11 @@ class EnhancedLPMonitor:
     def monitor_positions(self):
         """Main monitoring loop with Rich Live display and integrated status messages"""
         if self.use_rich:
-            console.print("[bold green]🔄 Starting position monitoring...[/bold green]")
-            console.print(f"[white]⏰ Checking every {self.config['check_interval']} seconds[/white]")
+            console.print("[bold green]Starting position monitoring...[/bold green]")
+            console.print(f"[white]Checking every {self.config['check_interval']} seconds[/white]")
         else:
-            print("🔄 Starting position monitoring...")
-            print(f"⏰ Checking every {self.config['check_interval']} seconds")
+            print("Starting position monitoring...")
+            print(f"Checking every {self.config['check_interval']} seconds")
         
         cycles_since_refresh = 0
         refresh_interval = 20  # Refresh every 20 cycles
@@ -218,18 +221,19 @@ class EnhancedLPMonitor:
                         positions_with_status, 
                         self.wallet_address,
                         refresh_countdown=refresh_countdown,
-                        notification_sent=(notification_sent_timer > 0)
+                        notification_sent=(notification_sent_timer > 0),
+                        refresh_cycle=(cycles_since_refresh, refresh_interval)
                     )
                 else:
                     # Fallback to simple display
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    status_line = f"🕐 {timestamp}"
+                    status_line = f"{timestamp}"
                     
                     if refresh_countdown:
-                        status_line += f" | ⏰ Refresh in {refresh_countdown} cycles"
+                        status_line += f" | Refresh in {refresh_countdown} cycles"
                     
                     if notification_sent_timer > 0:
-                        status_line += " | 🔔 Notification sent"
+                        status_line += " | Notification sent"
                     
                     print(f"\n{status_line}")
                     print("=" * 70)
@@ -238,24 +242,37 @@ class EnhancedLPMonitor:
                         positions_with_status, 
                         self.wallet_address,
                         refresh_countdown=refresh_countdown,
-                        notification_sent=(notification_sent_timer > 0)
+                        notification_sent=(notification_sent_timer > 0),
+                        refresh_cycle=(cycles_since_refresh, refresh_interval)
                     )
                 
                 # Handle position refresh
                 should_refresh = cycles_since_refresh >= refresh_interval
                 if should_refresh:
+                    is_refreshing = True
                     if self.use_rich:
-                        with console.status("[yellow]Refreshing position list...", spinner="dots"):
-                            changes_detected = self.refresh_positions()
+                        # Render a cycle with the refreshing flag on
+                        if self.config.get("display_settings", {}).get("clear_screen", True):
+                            clear_screen()
+                        self.display.display_positions(
+                            positions_with_status,
+                            self.wallet_address,
+                            refresh_countdown=refresh_countdown,
+                            notification_sent=(notification_sent_timer > 0),
+                            refresh_cycle=(cycles_since_refresh, refresh_interval),
+                            is_refreshing=True
+                        )
                     else:
-                        print("\n🔄 Refreshing position list...")
-                        changes_detected = self.refresh_positions()
+                        print("\nRefreshing position list...")
+                    # Perform silent refresh
+                    changes_detected = self.refresh_positions(silent=True)
                     
                     cycles_since_refresh = 0
                     if changes_detected:
                         # Changes will be reflected in next display update
                         # No need for extra message
                         pass
+                    is_refreshing = False
                 
                 # Handle zero liquidity detection (immediate refresh)
                 zero_liquidity_detected = False
@@ -265,17 +282,17 @@ class EnhancedLPMonitor:
                         if live_liquidity == 0:
                             zero_liquidity_detected = True
                             if self.use_rich:
-                                console.print(f"[yellow]👻 {position['name']} on {position['dex_name']} now has zero liquidity![/yellow]")
+                                console.print(f"[yellow]{position['name']} on {position['dex_name']} now has zero liquidity[/yellow]")
                             else:
-                                print(f"👻 {position['name']} on {position['dex_name']} now has zero liquidity!")
+                                print(f"{position['name']} on {position['dex_name']} now has zero liquidity")
                             break
                 
                 if zero_liquidity_detected:
                     if self.use_rich:
-                        console.print("[yellow]🔄 Zero liquidity detected - refreshing immediately![/yellow]")
+                        console.print("[yellow]Zero liquidity detected - refreshing immediately[/yellow]")
                     else:
-                        print("🔄 Zero liquidity detected - refreshing immediately!")
-                    self.refresh_positions()
+                        print("Zero liquidity detected - refreshing immediately")
+                    self.refresh_positions(silent=True)
                     cycles_since_refresh = 0
                     time.sleep(2)
                     continue
@@ -351,7 +368,7 @@ class EnhancedLPMonitor:
         
         return positions_with_status
 
-    def refresh_positions(self):
+    def refresh_positions(self, silent=False):
         """Re-scan for positions to catch new ones and remove old ones"""
         old_count = len(self.positions)
         old_positions = {f"{pos['dex_name']}_{pos['token_id']}" for pos in self.positions}
@@ -361,7 +378,7 @@ class EnhancedLPMonitor:
         wallet_address = self.config["wallet_address"]
         
         for dex_config in self.config["dexes"]:
-            positions = self.blockchain.fetch_positions_from_dex(wallet_address, dex_config)
+            positions = self.blockchain.fetch_positions_from_dex(wallet_address, dex_config, silent=silent)
             self.positions.extend(positions)
         
         new_count = len(self.positions)
