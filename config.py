@@ -3,17 +3,16 @@
 Configuration Management Module for HyperEVM LP Monitor
 Handles loading, saving, and setup of LP monitor configuration
 
-UPDATED VERSION: Smart notification setup with per-position cooldowns + Fee tracking options
+UPDATED VERSION: Smart notification setup with per-position cooldowns + Fee tracking + Rich UI
 
-Version: 1.4.1 (Smart Notifications + Fee Tracking)
-Developer: 8roku8.hl
+Version: 1.5.0 (Smart Notifications + Fee Tracking + Rich UI)
+Developer: 8roku8.hl + Claude
 """
 
 import json
 import os
 import copy
 from constants import DEFAULT_CONFIG, CONFIG_FILE
-from display import get_color_scheme_from_user
 from utils import validate_dex_configs
 
 def load_config():
@@ -88,7 +87,7 @@ def validate_config(config):
     return True
 
 def setup_first_run():
-    """Interactive setup for first-time users with smart notification system"""
+    """Interactive setup for first-time users with smart notification system and Rich UI"""
     print("╔══════════════════════════════════════════════════════════════╗")
     print("║              WELCOME TO HYPEREVM LP MONITOR                 ║")
     print("║                    First Time Setup                         ║")
@@ -100,8 +99,8 @@ def setup_first_run():
     
     print(f"Let's set up your LP monitor. You can modify these settings later in {CONFIG_FILE}\n")
     
-    # Color scheme selection
-    config["display_settings"]["color_scheme"] = get_color_scheme_from_user()
+    # Display preferences (Rich UI + color scheme)
+    config = setup_display_preferences(config)
     
     # Wallet setup
     config = setup_wallet(config)
@@ -125,6 +124,73 @@ def setup_first_run():
     print("🚀 You can now run the monitor again!")
     
     return config
+
+def setup_display_preferences(config):
+    """Setup display preferences including Rich UI and color schemes"""
+    print("🎨 Display Preferences:")
+    
+    # Rich UI option
+    print("\n📺 Display Options:")
+    print("1. Rich UI with beautiful tables (recommended)")
+    print("2. Simple colored text")
+    print("3. Plain text (no colors)")
+    
+    choice = input("Choose display mode (1-3, default: 1): ").strip()
+    
+    if choice == "2":
+        config["display_settings"]["use_rich_ui"] = False
+        config["display_settings"]["color_scheme"] = "minimal"
+        print("📺 Simple colored text display selected")
+    elif choice == "3":
+        config["display_settings"]["use_rich_ui"] = False
+        config["display_settings"]["color_scheme"] = "none"
+        print("📺 Plain text display selected")
+    else:
+        config["display_settings"]["use_rich_ui"] = True
+        config["display_settings"]["color_scheme"] = "rich"
+        print("📺 Rich UI enabled - enjoy beautiful tables and visualizations!")
+        
+        # Additional Rich UI options
+        compact_input = input("\nUse compact display mode? (y/n, default: n): ").strip().lower()
+        if compact_input in ['y', 'yes']:
+            config["display_settings"]["compact_mode"] = True
+            print("📺 Compact mode enabled - more positions visible at once")
+        else:
+            config["display_settings"]["compact_mode"] = False
+            print("📺 Full display mode - detailed position information")
+        
+        # Table style for Rich UI
+        print("\n📊 Table Style:")
+        print("1. Rounded borders (default)")
+        print("2. Simple borders")
+        print("3. Double borders")
+        
+        style_choice = input("Choose table style (1-3, default: 1): ").strip()
+        if style_choice == "2":
+            config["display_settings"]["table_style"] = "simple"
+        elif style_choice == "3":
+            config["display_settings"]["table_style"] = "double"
+        else:
+            config["display_settings"]["table_style"] = "rounded"
+        
+        print(f"📊 Table style: {config['display_settings']['table_style']}")
+    
+    return config
+
+def get_color_scheme_from_user():
+    """Legacy function for backward compatibility"""
+    print("📺 Display Options:")
+    print("1. Rich UI with beautiful tables (recommended)")
+    print("2. Simple colored text")
+    print("3. Plain text (no colors)")
+    
+    choice = input("Choose display mode (1-3, default: 1): ").strip()
+    if choice == "2":
+        return "minimal"
+    elif choice == "3":
+        return "none"
+    else:
+        return "rich"
 
 def setup_wallet(config):
     """Setup wallet address"""
@@ -198,13 +264,24 @@ def setup_optional_settings(config):
         config["check_interval"] = int(interval_input)
     
     # Screen clearing
-    clear_screen_input = input(f"\nEnable screen clearing for cleaner display? (y/n): ").strip().lower()
-    if clear_screen_input in ['n', 'no']:
-        config["display_settings"]["clear_screen"] = False
-        print("📺 Screen clearing disabled - output will scroll")
+    if config["display_settings"].get("use_rich_ui", True):
+        # Rich UI benefits from screen clearing
+        clear_screen_input = input(f"\nEnable screen clearing for cleaner display? (y/n, default: y): ").strip().lower()
+        if clear_screen_input in ['n', 'no']:
+            config["display_settings"]["clear_screen"] = False
+            print("📺 Screen clearing disabled - output will scroll")
+        else:
+            config["display_settings"]["clear_screen"] = True
+            print("📺 Screen clearing enabled - cleaner display")
     else:
-        config["display_settings"]["clear_screen"] = True
-        print("📺 Screen clearing enabled - cleaner display")
+        # For simple text, scrolling might be preferred
+        clear_screen_input = input(f"\nEnable screen clearing? (y/n, default: n): ").strip().lower()
+        if clear_screen_input in ['y', 'yes']:
+            config["display_settings"]["clear_screen"] = True
+            print("📺 Screen clearing enabled")
+        else:
+            config["display_settings"]["clear_screen"] = False
+            print("📺 Screen clearing disabled - output will scroll")
     
     # Fee tracking
     fees_input = input(f"\nEnable unclaimed fee tracking? (y/n, default: y): ").strip().lower()
@@ -220,6 +297,16 @@ def setup_optional_settings(config):
     if debug_input in ['y', 'yes']:
         config["display_settings"]["debug_mode"] = True
         print("🔍 Debug mode enabled - will show detailed calculation info")
+    
+    # Rich UI specific: Show animations
+    if config["display_settings"].get("use_rich_ui", True):
+        animations_input = input(f"\nShow loading animations and progress bars? (y/n, default: y): ").strip().lower()
+        if animations_input in ['n', 'no']:
+            config["display_settings"]["refresh_animation"] = False
+            print("🎬 Animations disabled")
+        else:
+            config["display_settings"]["refresh_animation"] = True
+            print("🎬 Animations enabled - smoother visual feedback")
     
     return config
 
