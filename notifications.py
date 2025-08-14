@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
 Notification Management Module for HyperEVM LP Monitor
-Handles all notification methods: Telegram, Discord, Pushover, Email
+Handles Telegram & Discord
 
-COMPLETE UPDATED VERSION: Per-position cooldowns + state cleanup + fee information
-
-Version: 1.4.1 (Complete with State Cleanup + Fee Information)
+Version: 1.5.0 (Complete with State Cleanup + Fee Information)
 Developer: 8roku8.hl
 """
 

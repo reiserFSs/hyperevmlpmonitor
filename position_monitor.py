@@ -4,7 +4,7 @@ Enhanced Position Monitoring Module for HyperEVM LP Monitor
 Core LP position monitoring with PnL/IL tracking and Rich UI
 
 Version: 1.6.0 (Complete with PnL/IL + Rich UI + Status Messages)
-Developer: 8roku8.hl + Claude
+Developer: 8roku8.hl
 """
 
 import time
@@ -78,6 +78,8 @@ class EnhancedLPMonitor:
         # PnL/IL toggles from config
         self.pnl_enabled = config.get("pnl_settings", {}).get("enabled", True)
         self.include_il_metrics = config.get("pnl_settings", {}).get("include_il_metrics", True)
+        # Track pending removals to avoid false negatives from rate limits
+        self._pending_removed_keys = set()
         
         # Display configuration info
         self.print_initial_info()
@@ -264,14 +266,18 @@ class EnhancedLPMonitor:
                             refresh_countdown=refresh_countdown,
                             notification_sent=(notification_sent_timer > 0),
                             refresh_cycle=(cycles_since_refresh, refresh_interval),
-                            is_refreshing=True
+                            is_refreshing=True,
+                            next_full_rescan_s=max(0, (full_rescan_interval_cycles - cycles_since_full_rescan) * self.config["check_interval"])
                         )
                     else:
                         print("\nRefreshing position list...")
                     # Perform silent refresh
                     # Every N cycles force a full rescan by resetting event windows via non-silent pass
                     force_full = cycles_since_full_rescan >= full_rescan_interval_cycles
-                    changes_detected = self.refresh_positions(silent=not force_full)
+                    changes_detected, had_errors = self.refresh_positions(silent=not force_full, force_full=force_full)
+                    if had_errors:
+                        # Keep footer hint but avoid noisy state changes
+                        time.sleep(2)
                     
                     cycles_since_refresh = 0
                     cycles_since_full_rescan = 0 if force_full else cycles_since_full_rescan
@@ -395,51 +401,99 @@ class EnhancedLPMonitor:
         
         return positions_with_status
 
-    def refresh_positions(self, silent=False):
-        """Re-scan for positions to catch new ones and remove old ones"""
-        old_count = len(self.positions)
-        old_positions = {f"{pos['dex_name']}_{pos['token_id']}" for pos in self.positions}
-        
-        # Clear and re-fetch positions
-        self.positions = []
+    def refresh_positions(self, silent=False, force_full=False):
+        """Refresh position list.
+        - Maintenance (force_full=False): merge updates; never remove entries.
+        - Full rescan (force_full=True): compute added/removed with safety checks.
+        """
+        old_positions_list = list(self.positions)
+        old_count = len(old_positions_list)
+        old_keys = {f"{pos['dex_name']}_{pos['token_id']}" for pos in old_positions_list}
+
+        # Build new list without mutating current until we know scan quality
+        new_list = []
         wallet_address = self.config["wallet_address"]
-        
+        had_errors_any = False
+
         for dex_config in self.config["dexes"]:
-            positions = self.blockchain.fetch_positions_from_dex(wallet_address, dex_config, silent=silent)
-            self.positions.extend(positions)
-        
-        new_count = len(self.positions)
-        new_positions = {f"{pos['dex_name']}_{pos['token_id']}" for pos in self.positions}
-        
-        # Analyze changes
-        added_positions = new_positions - old_positions
-        removed_positions = old_positions - new_positions
-        
-        if added_positions or removed_positions:
+            positions = self.blockchain.fetch_positions_from_dex(
+                wallet_address,
+                dex_config,
+                suppress_output=True,
+                force_full=not silent
+            )
+            if positions is None and silent:
+                # Maintenance refresh with no detected changes or log failure: keep previous positions for this DEX
+                prev = [p for p in old_positions_list if p.get('dex_name') == dex_config.get('name')]
+                new_list.extend(prev)
+                continue
+            new_list.extend(positions or [])
+            # Check scan status
+            status = self.blockchain.get_last_scan_status(dex_config.get('name')) or {}
+            if status.get('had_errors'):
+                had_errors_any = True
+
+        new_count = len(new_list)
+        new_keys = {f"{pos['dex_name']}_{pos['token_id']}" for pos in new_list}
+
+        # Maintenance mode: do nothing to the list (no merge, no removals).
+        # We keep metrics fresh each cycle elsewhere; discovery happens only on full rescan.
+        if not force_full:
+            return False, had_errors_any
+
+        # Commit new list
+        self.positions = new_list
+
+        added = new_keys - old_keys
+        removed = old_keys - new_keys
+
+        # Cross-check removals against on-chain Transfer events (if available)
+        suspected_removed = set()
+        for dex_cfg in self.config['dexes']:
+            hints = self.blockchain.get_last_event_hints(dex_cfg.get('name'))
+            if hints and hints.get('removed_ids'):
+                for pos in old_positions_list:
+                    if pos.get('dex_name') == dex_cfg.get('name') and pos.get('token_id') in hints['removed_ids']:
+                        suspected_removed.add(f"{pos['dex_name']}_{pos['token_id']}")
+        # Only remove positions that are either event-confirmed or persistently missing
+        event_confirmed_removed = removed & suspected_removed
+        removed = event_confirmed_removed
+
+        # Debounce removals across scans to protect against transient rate limits
+        if had_errors_any:
+            # Mark removed keys as pending, but do not act yet
+            self._pending_removed_keys.update(removed)
+            removed = set()
+        else:
+            # Confirm pending removals only if still missing without errors
+            confirmed_removed = {k for k in self._pending_removed_keys if k not in new_keys}
+            removed |= confirmed_removed
+            self._pending_removed_keys -= confirmed_removed
+
+        if (added or removed) and not had_errors_any:
             if self.use_rich:
                 console.print("\n[bold]📋 Position Changes Detected:[/bold]")
-                if added_positions:
-                    console.print(f"[green]➕ Added {len(added_positions)} new position(s)[/green]")
-                if removed_positions:
-                    console.print(f"[red]➖ Removed {len(removed_positions)} position(s)[/red]")
+                if added:
+                    console.print(f"[green]➕ Added {len(added)} new position(s)[/green]")
+                if removed:
+                    console.print(f"[red]➖ Removed {len(removed)} position(s)[/red]")
             else:
                 print("\n📋 Position Changes Detected:")
-                if added_positions:
-                    print(f"➕ Added {len(added_positions)} new position(s)")
-                if removed_positions:
-                    print(f"➖ Removed {len(removed_positions)} position(s)")
-            
-            # Send notification about changes
-            if self.notifications.enabled and (added_positions or removed_positions):
+                if added:
+                    print(f"➕ Added {len(added)} new position(s)")
+                if removed:
+                    print(f"➖ Removed {len(removed)} position(s)")
+
+            if self.notifications.enabled:
                 self.notifications.send_portfolio_update_notification(
-                    len(added_positions), 
-                    len(removed_positions), 
+                    len(added),
+                    len(removed),
                     len(self.positions),
                     self.config["wallet_address"],
                     self.positions
                 )
-        
-        return new_count != old_count
+
+        return (new_count != old_count), had_errors_any
 
 
 # Export for backward compatibility

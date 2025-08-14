@@ -3,8 +3,8 @@
 Enhanced Display Management Module for HyperEVM LP Monitor
 Now with PnL and Impermanent Loss tracking
 
-Version: 1.6.0 (PnL/IL Enhancement)
-Developer: 8roku8.hl + Claude
+Version: 1.5.0 (PnL/IL Enhancement)
+Developer: 8roku8.hl
 """
 
 import os
@@ -205,8 +205,15 @@ class RichDisplayManager:
                     apr = pnl_metrics['fee_apr']
                     if apr > 0:
                         apr_text = Text(f"{apr:.1f}%", style="cyan")
-                        # Add time in position
+                        # Add time in position: prefer on-chain acquired timestamp when present
                         hours = pnl_metrics['hours_in_position']
+                        if status.get('acquired_timestamp'):
+                            from datetime import datetime
+                            try:
+                                onchain_hours = max(0.0, (datetime.now().timestamp() - float(status['acquired_timestamp'])) / 3600)
+                                hours = max(hours, onchain_hours)
+                            except Exception:
+                                pass
                         if hours < 24:
                             apr_text.append(f"\n{hours:.1f}h", style="dim")
                         else:
@@ -447,16 +454,13 @@ class RichDisplayManager:
         footer_text.append(f"Last Update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", style="dim")
         
         # Replace legacy cycle counter with next full rescan ETA if available
-        if isinstance(next_full_rescan_s, (int, float)) and next_full_rescan_s is not None and next_full_rescan_s >= 0:
+        if isinstance(next_full_rescan_s, (int, float)) and next_full_rescan_s is not None and next_full_rescan_s > 0:
             minutes = int(next_full_rescan_s // 60)
             seconds = int(next_full_rescan_s % 60)
             eta_str = f"{minutes}m {seconds:02d}s" if minutes > 0 else f"{seconds}s"
             footer_text.append(f" | Next full rescan in {eta_str}", style="cyan")
         
-        # Add refresh countdown if provided
-        if refresh_countdown is not None and refresh_countdown > 0:
-            # Keep a short hint for imminent maintenance cycles
-            footer_text.append(f" | Maintenance refresh soon", style="yellow")
+        # Maintenance hint removed (no longer applicable)
         
         # Background refresh hint
         if is_refreshing:

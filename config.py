@@ -6,7 +6,7 @@ Handles loading, saving, and setup of LP monitor configuration
 UPDATED VERSION: Smart notification setup with per-position cooldowns + Fee tracking + Rich UI
 
 Version: 1.5.0 (Smart Notifications + Fee Tracking + Rich UI)
-Developer: 8roku8.hl + Claude
+Developer: 8roku8.hl
 """
 
 import json
