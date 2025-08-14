@@ -88,6 +88,33 @@ DEFAULT_CONFIG = {
     }
 }
 
+# Multicall3 support (optional, falls back gracefully if unavailable)
+# Common Multicall3 address used on many EVM chains; override in config if needed
+MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
+
+# Minimal Multicall3 ABI for aggregate
+MULTICALL3_ABI = [
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"name": "target", "type": "address"},
+                    {"name": "callData", "type": "bytes"}
+                ],
+                "name": "calls",
+                "type": "tuple[]"
+            }
+        ],
+        "name": "aggregate",
+        "outputs": [
+            {"name": "blockNumber", "type": "uint256"},
+            {"name": "returnData", "type": "bytes[]"}
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    }
+]
+
 # Table styles for Rich UI
 TABLE_STYLES = {
     "rounded": "ROUNDED",

@@ -14,7 +14,7 @@ import time
 from constants import (
     POOL_ABI, ALGEBRA_POOL_ABI_V1, ALGEBRA_POOL_ABI_V3, MINIMAL_POOL_ABI,
     TOKEN_ABI, POSITION_MANAGER_ABI, FACTORY_ABI, ALGEBRA_FACTORY_ABI,
-    TOKEN_SYMBOL_MAPPINGS, KNOWN_TOKENS
+    TOKEN_SYMBOL_MAPPINGS, KNOWN_TOKENS, MULTICALL3_ADDRESS, MULTICALL3_ABI
 )
 from utils import (
     sqrt_price_to_price, tick_to_price, calculate_token_amounts,
@@ -36,6 +36,25 @@ class BlockchainManager:
             raise Exception("Failed to connect to HyperEVM blockchain")
         
         print("Connected to HyperEVM")
+
+        # Pool data cache (per-cycle TTL)
+        self._pool_cache = {}
+        self._pool_cache_ttl_seconds = 5  # fresh enough for monitoring
+        self._last_cache_block = None
+
+        # Multicall contract (optional)
+        try:
+            self.multicall = self.w3.eth.contract(address=Web3.to_checksum_address(MULTICALL3_ADDRESS), abi=MULTICALL3_ABI)
+        except Exception:
+            self.multicall = None
+
+        # Event tracking per DEX
+        self._last_event_block_by_dex = {}
+
+        # Precompute event topic hashes
+        self._topic_transfer = self.w3.keccak(text="Transfer(address,address,uint256)").hex()
+        self._topic_increase = self.w3.keccak(text="IncreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
+        self._topic_decrease = self.w3.keccak(text="DecreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
 
     def get_enhanced_token_info(self, token_address, dex_name=""):
         """Enhanced token info with better symbol detection and mapping"""
@@ -179,6 +198,45 @@ class BlockchainManager:
         """Enhanced pool data getter with better Algebra parsing"""
         if not pool_address:
             return None
+
+        # Cache key
+        try:
+            block_number = self.w3.eth.block_number
+        except Exception:
+            block_number = None
+        now_ts = int(time.time())
+        cache_key = (pool_address, dex_type)
+        cached = self._pool_cache.get(cache_key)
+        if cached:
+            data, ts, blk = cached
+            if (now_ts - ts) <= self._pool_cache_ttl_seconds and (self._last_cache_block == blk or blk is None):
+                return data
+
+        # Helper for caching
+        def _cache_and_return(result_dict):
+            self._pool_cache[cache_key] = (result_dict, now_ts, block_number)
+            self._last_cache_block = block_number
+            return result_dict
+
+        # Helper: multicall token0/token1 (saves an RPC)
+        def _multicall_token_addresses():
+            try:
+                if not self.multicall:
+                    return None, None
+                pool_min = self.w3.eth.contract(address=Web3.to_checksum_address(pool_address), abi=MINIMAL_POOL_ABI)
+                calldata_t0 = pool_min.encodeABI(fn_name='token0')
+                calldata_t1 = pool_min.encodeABI(fn_name='token1')
+                calls = [
+                    (Web3.to_checksum_address(pool_address), calldata_t0),
+                    (Web3.to_checksum_address(pool_address), calldata_t1)
+                ]
+                block_num, ret = self.multicall.functions.aggregate(calls).call()
+                # ret[0] and ret[1] are bytes; decode as address (20 bytes right padded)
+                token0_address = Web3.to_checksum_address('0x' + ret[0][-20:].hex())
+                token1_address = Web3.to_checksum_address('0x' + ret[1][-20:].hex())
+                return token0_address, token1_address
+            except Exception:
+                return None, None
         
         if dex_type == "algebra_integral":
             # Try multiple Algebra versions
@@ -212,9 +270,11 @@ class BlockchainManager:
                         if self.debug_mode:
                             print(f"✅ Algebra {version} ABI worked! Tick: {current_tick}, Price: {sqrt_price_x96}")
                         
-                        # Get token addresses
-                        token0_address = pool_contract.functions.token0().call()
-                        token1_address = pool_contract.functions.token1().call()
+                        # Get token addresses (try multicall first)
+                        token0_address, token1_address = _multicall_token_addresses()
+                        if not token0_address or not token1_address:
+                            token0_address = pool_contract.functions.token0().call()
+                            token1_address = pool_contract.functions.token1().call()
                         
                         # Get enhanced token info
                         token0_info = self.get_enhanced_token_info(token0_address, "Algebra")
@@ -223,7 +283,7 @@ class BlockchainManager:
                         # Calculate price with correct decimals
                         price = sqrt_price_to_price(sqrt_price_x96, token0_info["decimals"], token1_info["decimals"])
                         
-                        return {
+                        return _cache_and_return({
                             "current_tick": current_tick,
                             "price": price,
                             "sqrt_price_x96": sqrt_price_x96,
@@ -233,7 +293,7 @@ class BlockchainManager:
                             "token1_symbol": token1_info["display_symbol"],
                             "algebra_version": version,
                             "method": f"algebra_{version}_abi"
-                        }
+                        })
                     else:
                         if self.debug_mode:
                             print(f"⚠️  Algebra {version} returned suspicious values: tick={current_tick}, price={sqrt_price_x96}")
@@ -254,8 +314,10 @@ class BlockchainManager:
                     abi=MINIMAL_POOL_ABI
                 )
                 
-                token0_address = pool_contract.functions.token0().call()
-                token1_address = pool_contract.functions.token1().call()
+                token0_address, token1_address = _multicall_token_addresses()
+                if not token0_address or not token1_address:
+                    token0_address = pool_contract.functions.token0().call()
+                    token1_address = pool_contract.functions.token1().call()
                 
                 # Try raw call to globalState
                 function_selector = self.w3.keccak(text="globalState()")[:4]
@@ -277,7 +339,7 @@ class BlockchainManager:
                     # Calculate price with correct decimals
                     price = sqrt_price_to_price(sqrt_price_x96, token0_info["decimals"], token1_info["decimals"])
                     
-                    return {
+                    return _cache_and_return({
                         "current_tick": current_tick,
                         "price": price,
                         "sqrt_price_x96": sqrt_price_x96,
@@ -287,7 +349,7 @@ class BlockchainManager:
                         "token1_symbol": token1_info["display_symbol"],
                         "algebra_version": "enhanced_raw",
                         "method": "enhanced_raw_parsing"
-                    }
+                    })
                     
             except Exception as e:
                 if self.debug_mode:
@@ -307,9 +369,10 @@ class BlockchainManager:
             current_tick = slot0[1]
             sqrt_price_x96 = slot0[0]
             
-            # Get token addresses
-            token0_address = pool_contract.functions.token0().call()
-            token1_address = pool_contract.functions.token1().call()
+            token0_address, token1_address = _multicall_token_addresses()
+            if not token0_address or not token1_address:
+                token0_address = pool_contract.functions.token0().call()
+                token1_address = pool_contract.functions.token1().call()
             
             # Get enhanced token info
             token0_info = self.get_enhanced_token_info(token0_address, "Uniswap V3")
@@ -318,7 +381,7 @@ class BlockchainManager:
             # Calculate price with correct decimals
             price = sqrt_price_to_price(sqrt_price_x96, token0_info["decimals"], token1_info["decimals"])
             
-            return {
+            return _cache_and_return({
                 "current_tick": current_tick,
                 "price": price,
                 "sqrt_price_x96": sqrt_price_x96,
@@ -327,11 +390,157 @@ class BlockchainManager:
                 "token0_symbol": token0_info["display_symbol"],
                 "token1_symbol": token1_info["display_symbol"],
                 "method": "uniswap_v3"
-            }
+            })
             
         except Exception as e:
             print(f"⚠️  All methods failed for pool {pool_address}: {e}")
             return None
+
+        # Store in cache before returning (when successful paths return)
+        # Note: earlier returns bypass this; refactor by capturing 'result' then caching once.
+
+    def prefetch_pool_data(self, pool_entries):
+        """Prefetch pool tick/price and token metadata for a set of unique pools.
+
+        pool_entries: list of dicts/tuples with keys (or positions) (pool_address, dex_type)
+        """
+        if not pool_entries or not self.multicall:
+            return
+
+        # Normalize and dedupe
+        normalized = []
+        seen = set()
+        for entry in pool_entries:
+            if isinstance(entry, dict):
+                addr = entry.get('pool_address')
+                dtype = entry.get('dex_type', 'uniswap_v3')
+            else:
+                addr, dtype = entry
+            if not addr:
+                continue
+            key = (Web3.to_checksum_address(addr), dtype)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(key)
+
+        if not normalized:
+            return
+
+        # Build calls for slot0/globalState
+        slot0_selector = self.w3.keccak(text="slot0()")[:4]
+        global_selector = self.w3.keccak(text="globalState()")[:4]
+        calls = []
+        call_index = []  # map index -> (pool, dtype)
+        for addr, dtype in normalized:
+            selector = slot0_selector if dtype == 'uniswap_v3' else global_selector
+            calls.append((addr, selector.hex()))
+            call_index.append((addr, dtype))
+
+        try:
+            block_num, ret_datas = self.multicall.functions.aggregate([
+                (addr, bytes.fromhex(data[2:]) if isinstance(data, str) and data.startswith('0x') else data)
+                for addr, data in calls
+            ]).call()
+        except Exception:
+            return  # silently skip if multicall fails
+
+        # Decode helpers
+        def decode_slot0(data_bytes):
+            # Expect at least 2 words
+            if not data_bytes or len(data_bytes) < 64:
+                return None, None
+            sqrt_price = int.from_bytes(data_bytes[0:32], 'big')
+            tick_raw = int.from_bytes(data_bytes[32:64], 'big', signed=True)
+            return sqrt_price, tick_raw
+
+        def decode_global_state(data_bytes):
+            if not data_bytes or len(data_bytes) < 64:
+                return None, None
+            sqrt_price = int.from_bytes(data_bytes[0:32], 'big')
+            tick_raw = int.from_bytes(data_bytes[32:64], 'big', signed=True)
+            return sqrt_price, tick_raw
+
+        # First pass: decode ticks and sqrt prices
+        pool_to_core = {}
+        for i, (addr, dtype) in enumerate(call_index):
+            data_bytes = ret_datas[i]
+            sqrt_p, tick = (decode_slot0(data_bytes) if dtype == 'uniswap_v3' else decode_global_state(data_bytes))
+            if sqrt_p is None or tick is None:
+                continue
+            pool_to_core[(addr, dtype)] = (sqrt_p, tick)
+
+        if not pool_to_core:
+            return
+
+        # Batch token0/token1 for all pools
+        try:
+            pool_min = self.w3.eth.contract(abi=MINIMAL_POOL_ABI, address=Web3.to_checksum_address(list(pool_to_core.keys())[0][0]))
+            calldata_t0 = pool_min.encodeABI(fn_name='token0')[-8:]  # not used; we will encode per pool
+        except Exception:
+            pool_min = None
+
+        t_calls = []
+        index_list = []
+        for addr, dtype in pool_to_core.keys():
+            if pool_min:
+                # Build ABI per pool for correctness
+                pool_c = self.w3.eth.contract(address=addr, abi=MINIMAL_POOL_ABI)
+                t0 = pool_c.encodeABI(fn_name='token0')
+                t1 = pool_c.encodeABI(fn_name='token1')
+                t_calls.append((addr, bytes.fromhex(t0[2:])))
+                t_calls.append((addr, bytes.fromhex(t1[2:])))
+                index_list.append((addr, 0))
+                index_list.append((addr, 1))
+            else:
+                # Fallback to direct calls later
+                pass
+
+        token_map = {}
+        if t_calls:
+            try:
+                _, t_rets = self.multicall.functions.aggregate(t_calls).call()
+                for j, (addr, which) in enumerate(index_list):
+                    data = t_rets[j]
+                    if data and len(data) >= 32:
+                        token_addr = Web3.to_checksum_address('0x' + data[-20:].hex())
+                        token_map.setdefault(addr, [None, None])[which] = token_addr
+            except Exception:
+                token_map = {}
+
+        # Build cache entries
+        for (addr, dtype), (sqrt_p, tick) in pool_to_core.items():
+            try:
+                # Resolve token addresses (fallback to direct call if needed)
+                if addr in token_map:
+                    token0_address, token1_address = token_map[addr]
+                else:
+                    pool_c = self.w3.eth.contract(address=addr, abi=MINIMAL_POOL_ABI)
+                    token0_address = pool_c.functions.token0().call()
+                    token1_address = pool_c.functions.token1().call()
+
+                # Token metadata
+                token0_info = self.get_enhanced_token_info(token0_address, "Prefetch")
+                token1_info = self.get_enhanced_token_info(token1_address, "Prefetch")
+
+                # Compute price
+                price = sqrt_price_to_price(sqrt_p, token0_info["decimals"], token1_info["decimals"])
+
+                # Cache entry
+                result = {
+                    "current_tick": tick,
+                    "price": price,
+                    "sqrt_price_x96": sqrt_p,
+                    "token0_decimals": token0_info["decimals"],
+                    "token1_decimals": token1_info["decimals"],
+                    "token0_symbol": token0_info["display_symbol"],
+                    "token1_symbol": token1_info["display_symbol"],
+                    "method": "multicall_slot0" if dtype == 'uniswap_v3' else "multicall_globalState"
+                }
+                self._pool_cache[(addr, dtype)] = (result, int(time.time()), self.w3.eth.block_number)
+                self._last_cache_block = self.w3.eth.block_number
+            except Exception:
+                continue
 
     def detect_dex_type(self, dex_name, factory_address):
         """Auto-detect DEX type based on available methods"""
@@ -437,8 +646,40 @@ class BlockchainManager:
             except Exception as e:
                 print(f"⚠️  Could not get factory address from {dex_name} position manager: {e}")
             
-            # Get number of positions owned by wallet
-            balance = position_manager.functions.balanceOf(wallet_address).call()
+            # Event-driven refresh: try to detect changes since last scan
+            latest_block = self.w3.eth.block_number
+            start_block = self._last_event_block_by_dex.get(dex_name, max(latest_block - 2400, 0))  # ~5-10 min window
+
+            changes_detected = False
+            try:
+                logs_transfer = self.w3.eth.get_logs({
+                    'fromBlock': start_block,
+                    'toBlock': latest_block,
+                    'address': Web3.to_checksum_address(position_manager_address),
+                    'topics': [self._topic_transfer, None, None]
+                })
+                logs_liq_inc = self.w3.eth.get_logs({
+                    'fromBlock': start_block,
+                    'toBlock': latest_block,
+                    'address': Web3.to_checksum_address(position_manager_address),
+                    'topics': [self._topic_increase]
+                })
+                logs_liq_dec = self.w3.eth.get_logs({
+                    'fromBlock': start_block,
+                    'toBlock': latest_block,
+                    'address': Web3.to_checksum_address(position_manager_address),
+                    'topics': [self._topic_decrease]
+                })
+                if logs_transfer or logs_liq_inc or logs_liq_dec:
+                    changes_detected = True
+            except Exception:
+                # If log fetch fails, fall back to full scan
+                changes_detected = True
+
+            self._last_event_block_by_dex[dex_name] = latest_block
+
+            # Get number of positions owned by wallet (only if changes or first run)
+            balance = position_manager.functions.balanceOf(wallet_address).call() if changes_detected or not silent else position_manager.functions.balanceOf(wallet_address).call()
             if not silent:
                 print(f"Found {balance} LP NFT(s) in {dex_name}")
             

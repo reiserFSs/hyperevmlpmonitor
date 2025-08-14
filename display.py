@@ -419,7 +419,7 @@ class RichDisplayManager:
         return Panel(summary_text, title="Performance", border_style="green", box=box.ROUNDED)
     
     def create_dashboard_layout_with_pnl(self, positions_with_status, wallet_address, 
-                                         refresh_countdown=None, notification_sent=False, refresh_cycle=None, is_refreshing=False):
+                                         refresh_countdown=None, notification_sent=False, refresh_cycle=None, is_refreshing=False, next_full_rescan_s=None):
         """Create dashboard layout with PnL metrics and status messages"""
         layout = Layout()
         
@@ -446,20 +446,17 @@ class RichDisplayManager:
         footer_text = Text()
         footer_text.append(f"Last Update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", style="dim")
         
-        # Always show refresh cycle if provided (e.g., 3/20)
-        if refresh_cycle and isinstance(refresh_cycle, tuple) and len(refresh_cycle) == 2:
-            current_cycle, total_cycles = refresh_cycle
-            try:
-                current_cycle_int = int(current_cycle)
-                total_cycles_int = int(total_cycles)
-                footer_text.append(f" | 🔁 Refresh {current_cycle_int}/{total_cycles_int}", style="cyan")
-            except Exception:
-                # If casting fails, skip gracefully
-                pass
+        # Replace legacy cycle counter with next full rescan ETA if available
+        if isinstance(next_full_rescan_s, (int, float)) and next_full_rescan_s is not None and next_full_rescan_s >= 0:
+            minutes = int(next_full_rescan_s // 60)
+            seconds = int(next_full_rescan_s % 60)
+            eta_str = f"{minutes}m {seconds:02d}s" if minutes > 0 else f"{seconds}s"
+            footer_text.append(f" | Next full rescan in {eta_str}", style="cyan")
         
         # Add refresh countdown if provided
         if refresh_countdown is not None and refresh_countdown > 0:
-            footer_text.append(f" | Refresh in {refresh_countdown} cycles", style="yellow")
+            # Keep a short hint for imminent maintenance cycles
+            footer_text.append(f" | Maintenance refresh soon", style="yellow")
         
         # Background refresh hint
         if is_refreshing:
@@ -508,7 +505,7 @@ class RichDisplayManager:
         return Panel(stats_text, title="Stats", border_style="green", box=box.ROUNDED)
     
     def print_live_dashboard(self, positions_with_status, wallet_address, 
-                           refresh_countdown=None, notification_sent=False, refresh_cycle=None, is_refreshing=False):
+                           refresh_countdown=None, notification_sent=False, refresh_cycle=None, is_refreshing=False, next_full_rescan_s=None):
         """Print the live updating dashboard with PnL and status messages"""
         layout = self.create_dashboard_layout_with_pnl(
             positions_with_status, 
@@ -516,7 +513,8 @@ class RichDisplayManager:
             refresh_countdown=refresh_countdown,
             notification_sent=notification_sent,
             refresh_cycle=refresh_cycle,
-            is_refreshing=is_refreshing
+            is_refreshing=is_refreshing,
+            next_full_rescan_s=next_full_rescan_s
         )
         self.console.print(layout)
 
@@ -558,7 +556,7 @@ class EnhancedDisplayManager:
             print(f"{self.c('end')}")
     
     def display_positions(self, positions_with_status, wallet_address, 
-                        refresh_countdown=None, notification_sent=False, refresh_cycle=None, is_refreshing=False):
+                        refresh_countdown=None, notification_sent=False, refresh_cycle=None, is_refreshing=False, next_full_rescan_s=None):
         """Display all positions with PnL metrics and status messages"""
         if self.use_rich:
             self.rich_display.print_live_dashboard(
@@ -567,7 +565,8 @@ class EnhancedDisplayManager:
                 refresh_countdown=refresh_countdown,
                 notification_sent=notification_sent,
                 refresh_cycle=refresh_cycle,
-                is_refreshing=is_refreshing
+                is_refreshing=is_refreshing,
+                next_full_rescan_s=next_full_rescan_s
             )
         else:
             self.display_positions_simple(positions_with_status)
@@ -576,11 +575,12 @@ class EnhancedDisplayManager:
                 try:
                     current_cycle_int = int(refresh_cycle[0])
                     total_cycles_int = int(refresh_cycle[1])
-                    print(f"🔁 Refresh {current_cycle_int}/{total_cycles_int}")
+                    # Legacy: suppress noisy ratio prints
+                    pass
                 except Exception:
                     pass
             if refresh_countdown is not None and refresh_countdown > 0:
-                print(f"⏰ Position refresh in {refresh_countdown} cycles")
+                print(f"Maintenance refresh soon")
             if notification_sent:
                 print("🔔 Notification sent")
     

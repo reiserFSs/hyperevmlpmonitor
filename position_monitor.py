@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.spinner import Spinner
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from blockchain import BlockchainManager
 from notifications import NotificationManager
@@ -181,6 +182,8 @@ class EnhancedLPMonitor:
         
         cycles_since_refresh = 0
         refresh_interval = 20  # Refresh every 20 cycles
+        full_rescan_interval_cycles = 300 // max(1, self.config.get("check_interval", 30))  # ~5 minutes default
+        cycles_since_full_rescan = 0
         notification_sent_timer = 0  # Track how long to show notification message
         
         while True:
@@ -222,7 +225,8 @@ class EnhancedLPMonitor:
                         self.wallet_address,
                         refresh_countdown=refresh_countdown,
                         notification_sent=(notification_sent_timer > 0),
-                        refresh_cycle=(cycles_since_refresh, refresh_interval)
+                        refresh_cycle=(cycles_since_refresh, refresh_interval),
+                        next_full_rescan_s=max(0, (full_rescan_interval_cycles - cycles_since_full_rescan) * self.config["check_interval"])
                     )
                 else:
                     # Fallback to simple display
@@ -265,9 +269,12 @@ class EnhancedLPMonitor:
                     else:
                         print("\nRefreshing position list...")
                     # Perform silent refresh
-                    changes_detected = self.refresh_positions(silent=True)
+                    # Every N cycles force a full rescan by resetting event windows via non-silent pass
+                    force_full = cycles_since_full_rescan >= full_rescan_interval_cycles
+                    changes_detected = self.refresh_positions(silent=not force_full)
                     
                     cycles_since_refresh = 0
+                    cycles_since_full_rescan = 0 if force_full else cycles_since_full_rescan
                     if changes_detected:
                         # Changes will be reflected in next display update
                         # No need for extra message
@@ -300,6 +307,7 @@ class EnhancedLPMonitor:
                 # Wait before next check
                 time.sleep(self.config["check_interval"])
                 cycles_since_refresh += 1
+                cycles_since_full_rescan += 1
                 
             except KeyboardInterrupt:
                 clear_screen()
@@ -339,32 +347,51 @@ class EnhancedLPMonitor:
                     total=len(self.positions)
                 )
                 
-                for position in self.positions:
-                    # Check liquidity
-                    live_liquidity = self.blockchain.get_live_liquidity(position)
+                def worker(pos):
+                    live_liquidity = self.blockchain.get_live_liquidity(pos)
                     if live_liquidity == 0:
+                        return None
+                    pos["liquidity"] = live_liquidity
+                    status = self.blockchain.check_position_status(pos, self.wallet_address)
+                    return (pos, status) if status else None
+
+                # Pre-fetch unique pools via multicall to warm the cache
+                unique_pools = {(p.get('pool_address'), p.get('dex_type', 'uniswap_v3')) for p in self.positions if p.get('pool_address')}
+                try:
+                    self.blockchain.prefetch_pool_data(list(unique_pools))
+                except Exception:
+                    pass
+
+                max_workers = min(16, max(4, len(self.positions)//2))
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = [executor.submit(worker, p) for p in self.positions]
+                    for fut in as_completed(futures):
+                        result = fut.result()
+                        if result:
+                            positions_with_status.append(result)
                         progress.advance(task)
-                        continue
-                    
-                    position["liquidity"] = live_liquidity
-                    
-                    # Get status with fee tracking
-                    status = self.blockchain.check_position_status(position, self.wallet_address)
-                    if status:
-                        positions_with_status.append((position, status))
-                    
-                    progress.advance(task)
         else:
             # Simple check without progress bar
-            for position in self.positions:
-                live_liquidity = self.blockchain.get_live_liquidity(position)
+            def worker(pos):
+                live_liquidity = self.blockchain.get_live_liquidity(pos)
                 if live_liquidity == 0:
-                    continue
-                
-                position["liquidity"] = live_liquidity
-                status = self.blockchain.check_position_status(position, self.wallet_address)
-                if status:
-                    positions_with_status.append((position, status))
+                    return None
+                pos["liquidity"] = live_liquidity
+                status = self.blockchain.check_position_status(pos, self.wallet_address)
+                return (pos, status) if status else None
+
+            # Pre-fetch unique pools via multicall to warm the cache
+            unique_pools = {(p.get('pool_address'), p.get('dex_type', 'uniswap_v3')) for p in self.positions if p.get('pool_address')}
+            try:
+                self.blockchain.prefetch_pool_data(list(unique_pools))
+            except Exception:
+                pass
+
+            max_workers = min(8, max(2, len(self.positions)//2))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for result in executor.map(worker, self.positions):
+                    if result:
+                        positions_with_status.append(result)
         
         return positions_with_status
 
