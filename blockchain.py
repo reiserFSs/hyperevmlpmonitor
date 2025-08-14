@@ -5,16 +5,17 @@ Handles Web3 connections, smart contract calls, and DEX-specific logic
 
 UPDATED VERSION: Added unclaimed fee tracking using static collect() calls
 
-Version: 1.4.1 (With Fee Tracking)
+Version: 1.5.0
 Developer: 8roku8.hl
 """
 
 from web3 import Web3
 import time
+from collections import deque
 from constants import (
     POOL_ABI, ALGEBRA_POOL_ABI_V1, ALGEBRA_POOL_ABI_V3, MINIMAL_POOL_ABI,
     TOKEN_ABI, POSITION_MANAGER_ABI, FACTORY_ABI, ALGEBRA_FACTORY_ABI,
-    TOKEN_SYMBOL_MAPPINGS, KNOWN_TOKENS
+    TOKEN_SYMBOL_MAPPINGS, KNOWN_TOKENS, MULTICALL3_ADDRESS, MULTICALL3_ABI
 )
 from utils import (
     sqrt_price_to_price, tick_to_price, calculate_token_amounts,
@@ -35,7 +36,54 @@ class BlockchainManager:
         if not self.w3.is_connected():
             raise Exception("Failed to connect to HyperEVM blockchain")
         
-        print(f"✅ Connected to HyperEVM")
+        print("Connected to HyperEVM")
+
+        # Pool data cache (per-cycle TTL)
+        self._pool_cache = {}
+        self._pool_cache_ttl_seconds = 5  # fresh enough for monitoring
+        self._last_cache_block = None
+
+        # Multicall contract (optional)
+        try:
+            self.multicall = self.w3.eth.contract(address=Web3.to_checksum_address(MULTICALL3_ADDRESS), abi=MULTICALL3_ABI)
+        except Exception:
+            self.multicall = None
+
+        # Event tracking per DEX
+        self._last_event_block_by_dex = {}
+        self._last_event_hints_by_dex = {}
+        self._last_scan_status_by_dex = {}
+        self._acquired_ts_cache = {}
+
+        # Global RPC rate limiter (tokens/minute)
+        self._rpm_limit = 90  # keep headroom under 100 rpm
+        self._rpc_call_times = deque()
+
+    def _throttle_rpc(self):
+        """Simple token-bucket-like limiter to keep under rpm limit."""
+        if self._rpm_limit <= 0:
+            return
+        now = time.time()
+        window = 60.0
+        # drop old
+        while self._rpc_call_times and (now - self._rpc_call_times[0]) > window:
+            self._rpc_call_times.popleft()
+        if len(self._rpc_call_times) >= self._rpm_limit:
+            sleep_for = window - (now - self._rpc_call_times[0]) + 0.05
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+        # record
+        self._rpc_call_times.append(time.time())
+
+    def _rl_call(self, fn, *args, **kwargs):
+        self._throttle_rpc()
+        return fn(*args, **kwargs)
+        self._last_scan_status_by_dex = {}
+
+        # Precompute event topic hashes
+        self._topic_transfer = self.w3.keccak(text="Transfer(address,address,uint256)").hex()
+        self._topic_increase = self.w3.keccak(text="IncreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
+        self._topic_decrease = self.w3.keccak(text="DecreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
 
     def get_enhanced_token_info(self, token_address, dex_name=""):
         """Enhanced token info with better symbol detection and mapping"""
@@ -179,6 +227,45 @@ class BlockchainManager:
         """Enhanced pool data getter with better Algebra parsing"""
         if not pool_address:
             return None
+
+        # Cache key
+        try:
+            block_number = self.w3.eth.block_number
+        except Exception:
+            block_number = None
+        now_ts = int(time.time())
+        cache_key = (pool_address, dex_type)
+        cached = self._pool_cache.get(cache_key)
+        if cached:
+            data, ts, blk = cached
+            if (now_ts - ts) <= self._pool_cache_ttl_seconds and (self._last_cache_block == blk or blk is None):
+                return data
+
+        # Helper for caching
+        def _cache_and_return(result_dict):
+            self._pool_cache[cache_key] = (result_dict, now_ts, block_number)
+            self._last_cache_block = block_number
+            return result_dict
+
+        # Helper: multicall token0/token1 (saves an RPC)
+        def _multicall_token_addresses():
+            try:
+                if not self.multicall:
+                    return None, None
+                pool_min = self.w3.eth.contract(address=Web3.to_checksum_address(pool_address), abi=MINIMAL_POOL_ABI)
+                calldata_t0 = pool_min.encodeABI(fn_name='token0')
+                calldata_t1 = pool_min.encodeABI(fn_name='token1')
+                calls = [
+                    (Web3.to_checksum_address(pool_address), calldata_t0),
+                    (Web3.to_checksum_address(pool_address), calldata_t1)
+                ]
+                block_num, ret = self.multicall.functions.aggregate(calls).call()
+                # ret[0] and ret[1] are bytes; decode as address (20 bytes right padded)
+                token0_address = Web3.to_checksum_address('0x' + ret[0][-20:].hex())
+                token1_address = Web3.to_checksum_address('0x' + ret[1][-20:].hex())
+                return token0_address, token1_address
+            except Exception:
+                return None, None
         
         if dex_type == "algebra_integral":
             # Try multiple Algebra versions
@@ -212,9 +299,11 @@ class BlockchainManager:
                         if self.debug_mode:
                             print(f"✅ Algebra {version} ABI worked! Tick: {current_tick}, Price: {sqrt_price_x96}")
                         
-                        # Get token addresses
-                        token0_address = pool_contract.functions.token0().call()
-                        token1_address = pool_contract.functions.token1().call()
+                        # Get token addresses (try multicall first)
+                        token0_address, token1_address = _multicall_token_addresses()
+                        if not token0_address or not token1_address:
+                            token0_address = pool_contract.functions.token0().call()
+                            token1_address = pool_contract.functions.token1().call()
                         
                         # Get enhanced token info
                         token0_info = self.get_enhanced_token_info(token0_address, "Algebra")
@@ -223,7 +312,7 @@ class BlockchainManager:
                         # Calculate price with correct decimals
                         price = sqrt_price_to_price(sqrt_price_x96, token0_info["decimals"], token1_info["decimals"])
                         
-                        return {
+                        return _cache_and_return({
                             "current_tick": current_tick,
                             "price": price,
                             "sqrt_price_x96": sqrt_price_x96,
@@ -233,7 +322,7 @@ class BlockchainManager:
                             "token1_symbol": token1_info["display_symbol"],
                             "algebra_version": version,
                             "method": f"algebra_{version}_abi"
-                        }
+                        })
                     else:
                         if self.debug_mode:
                             print(f"⚠️  Algebra {version} returned suspicious values: tick={current_tick}, price={sqrt_price_x96}")
@@ -254,8 +343,10 @@ class BlockchainManager:
                     abi=MINIMAL_POOL_ABI
                 )
                 
-                token0_address = pool_contract.functions.token0().call()
-                token1_address = pool_contract.functions.token1().call()
+                token0_address, token1_address = _multicall_token_addresses()
+                if not token0_address or not token1_address:
+                    token0_address = pool_contract.functions.token0().call()
+                    token1_address = pool_contract.functions.token1().call()
                 
                 # Try raw call to globalState
                 function_selector = self.w3.keccak(text="globalState()")[:4]
@@ -277,7 +368,7 @@ class BlockchainManager:
                     # Calculate price with correct decimals
                     price = sqrt_price_to_price(sqrt_price_x96, token0_info["decimals"], token1_info["decimals"])
                     
-                    return {
+                    return _cache_and_return({
                         "current_tick": current_tick,
                         "price": price,
                         "sqrt_price_x96": sqrt_price_x96,
@@ -287,7 +378,7 @@ class BlockchainManager:
                         "token1_symbol": token1_info["display_symbol"],
                         "algebra_version": "enhanced_raw",
                         "method": "enhanced_raw_parsing"
-                    }
+                    })
                     
             except Exception as e:
                 if self.debug_mode:
@@ -307,9 +398,10 @@ class BlockchainManager:
             current_tick = slot0[1]
             sqrt_price_x96 = slot0[0]
             
-            # Get token addresses
-            token0_address = pool_contract.functions.token0().call()
-            token1_address = pool_contract.functions.token1().call()
+            token0_address, token1_address = _multicall_token_addresses()
+            if not token0_address or not token1_address:
+                token0_address = pool_contract.functions.token0().call()
+                token1_address = pool_contract.functions.token1().call()
             
             # Get enhanced token info
             token0_info = self.get_enhanced_token_info(token0_address, "Uniswap V3")
@@ -318,7 +410,7 @@ class BlockchainManager:
             # Calculate price with correct decimals
             price = sqrt_price_to_price(sqrt_price_x96, token0_info["decimals"], token1_info["decimals"])
             
-            return {
+            return _cache_and_return({
                 "current_tick": current_tick,
                 "price": price,
                 "sqrt_price_x96": sqrt_price_x96,
@@ -327,11 +419,157 @@ class BlockchainManager:
                 "token0_symbol": token0_info["display_symbol"],
                 "token1_symbol": token1_info["display_symbol"],
                 "method": "uniswap_v3"
-            }
+            })
             
         except Exception as e:
             print(f"⚠️  All methods failed for pool {pool_address}: {e}")
             return None
+
+        # Store in cache before returning (when successful paths return)
+        # Note: earlier returns bypass this; refactor by capturing 'result' then caching once.
+
+    def prefetch_pool_data(self, pool_entries):
+        """Prefetch pool tick/price and token metadata for a set of unique pools.
+
+        pool_entries: list of dicts/tuples with keys (or positions) (pool_address, dex_type)
+        """
+        if not pool_entries or not self.multicall:
+            return
+
+        # Normalize and dedupe
+        normalized = []
+        seen = set()
+        for entry in pool_entries:
+            if isinstance(entry, dict):
+                addr = entry.get('pool_address')
+                dtype = entry.get('dex_type', 'uniswap_v3')
+            else:
+                addr, dtype = entry
+            if not addr:
+                continue
+            key = (Web3.to_checksum_address(addr), dtype)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(key)
+
+        if not normalized:
+            return
+
+        # Build calls for slot0/globalState
+        slot0_selector = self.w3.keccak(text="slot0()")[:4]
+        global_selector = self.w3.keccak(text="globalState()")[:4]
+        calls = []
+        call_index = []  # map index -> (pool, dtype)
+        for addr, dtype in normalized:
+            selector = slot0_selector if dtype == 'uniswap_v3' else global_selector
+            calls.append((addr, selector.hex()))
+            call_index.append((addr, dtype))
+
+        try:
+            block_num, ret_datas = self._rl_call(self.multicall.functions.aggregate([
+                (addr, bytes.fromhex(data[2:]) if isinstance(data, str) and data.startswith('0x') else data)
+                for addr, data in calls
+            ]).call)
+        except Exception:
+            return  # silently skip if multicall fails
+
+        # Decode helpers
+        def decode_slot0(data_bytes):
+            # Expect at least 2 words
+            if not data_bytes or len(data_bytes) < 64:
+                return None, None
+            sqrt_price = int.from_bytes(data_bytes[0:32], 'big')
+            tick_raw = int.from_bytes(data_bytes[32:64], 'big', signed=True)
+            return sqrt_price, tick_raw
+
+        def decode_global_state(data_bytes):
+            if not data_bytes or len(data_bytes) < 64:
+                return None, None
+            sqrt_price = int.from_bytes(data_bytes[0:32], 'big')
+            tick_raw = int.from_bytes(data_bytes[32:64], 'big', signed=True)
+            return sqrt_price, tick_raw
+
+        # First pass: decode ticks and sqrt prices
+        pool_to_core = {}
+        for i, (addr, dtype) in enumerate(call_index):
+            data_bytes = ret_datas[i]
+            sqrt_p, tick = (decode_slot0(data_bytes) if dtype == 'uniswap_v3' else decode_global_state(data_bytes))
+            if sqrt_p is None or tick is None:
+                continue
+            pool_to_core[(addr, dtype)] = (sqrt_p, tick)
+
+        if not pool_to_core:
+            return
+
+        # Batch token0/token1 for all pools
+        try:
+            pool_min = self.w3.eth.contract(abi=MINIMAL_POOL_ABI, address=Web3.to_checksum_address(list(pool_to_core.keys())[0][0]))
+            calldata_t0 = pool_min.encodeABI(fn_name='token0')[-8:]  # not used; we will encode per pool
+        except Exception:
+            pool_min = None
+
+        t_calls = []
+        index_list = []
+        for addr, dtype in pool_to_core.keys():
+            if pool_min:
+                # Build ABI per pool for correctness
+                pool_c = self.w3.eth.contract(address=addr, abi=MINIMAL_POOL_ABI)
+                t0 = pool_c.encodeABI(fn_name='token0')
+                t1 = pool_c.encodeABI(fn_name='token1')
+                t_calls.append((addr, bytes.fromhex(t0[2:])))
+                t_calls.append((addr, bytes.fromhex(t1[2:])))
+                index_list.append((addr, 0))
+                index_list.append((addr, 1))
+            else:
+                # Fallback to direct calls later
+                pass
+
+        token_map = {}
+        if t_calls:
+            try:
+                _, t_rets = self._rl_call(self.multicall.functions.aggregate(t_calls).call)
+                for j, (addr, which) in enumerate(index_list):
+                    data = t_rets[j]
+                    if data and len(data) >= 32:
+                        token_addr = Web3.to_checksum_address('0x' + data[-20:].hex())
+                        token_map.setdefault(addr, [None, None])[which] = token_addr
+            except Exception:
+                token_map = {}
+
+        # Build cache entries
+        for (addr, dtype), (sqrt_p, tick) in pool_to_core.items():
+            try:
+                # Resolve token addresses (fallback to direct call if needed)
+                if addr in token_map:
+                    token0_address, token1_address = token_map[addr]
+                else:
+                    pool_c = self.w3.eth.contract(address=addr, abi=MINIMAL_POOL_ABI)
+                    token0_address = pool_c.functions.token0().call()
+                    token1_address = pool_c.functions.token1().call()
+
+                # Token metadata
+                token0_info = self.get_enhanced_token_info(token0_address, "Prefetch")
+                token1_info = self.get_enhanced_token_info(token1_address, "Prefetch")
+
+                # Compute price
+                price = sqrt_price_to_price(sqrt_p, token0_info["decimals"], token1_info["decimals"])
+
+                # Cache entry
+                result = {
+                    "current_tick": tick,
+                    "price": price,
+                    "sqrt_price_x96": sqrt_p,
+                    "token0_decimals": token0_info["decimals"],
+                    "token1_decimals": token1_info["decimals"],
+                    "token0_symbol": token0_info["display_symbol"],
+                    "token1_symbol": token1_info["display_symbol"],
+                    "method": "multicall_slot0" if dtype == 'uniswap_v3' else "multicall_globalState"
+                }
+                self._pool_cache[(addr, dtype)] = (result, int(time.time()), self.w3.eth.block_number)
+                self._last_cache_block = self.w3.eth.block_number
+            except Exception:
+                continue
 
     def detect_dex_type(self, dex_name, factory_address):
         """Auto-detect DEX type based on available methods"""
@@ -349,7 +587,8 @@ class BlockchainManager:
             try:
                 # This will fail if not Algebra
                 test_call = factory_contract.functions.poolByPair
-                print(f"🔍 Auto-detected: {dex_name} uses Algebra Integral")
+                if self.debug_mode:
+                    print(f"Auto-detected: {dex_name} uses Algebra Integral")
                 return "algebra_integral"
             except:
                 pass
@@ -357,7 +596,8 @@ class BlockchainManager:
             pass
         
         # Default to Uniswap V3
-        print(f"🔍 Auto-detected: {dex_name} uses Uniswap V3")
+        if self.debug_mode:
+            print(f"Auto-detected: {dex_name} uses Uniswap V3")
         return "uniswap_v3"
 
     def get_pool_address(self, token0, token1, fee, factory_address, dex_type="uniswap_v3"):
@@ -387,20 +627,21 @@ class BlockchainManager:
                 pool_address = factory_contract.functions.getPool(token0, token1, fee).call()
             
             if pool_address == "0x0000000000000000000000000000000000000000":
-                print(f"⚠️  No pool found for tokens {token0[:6]}.../{token1[:6]}... (type: {dex_type})")
+                print(f"No pool found for tokens {token0[:6]}.../{token1[:6]}... (type: {dex_type})")
                 return None
                 
             return pool_address
             
         except Exception as e:
-            print(f"⚠️  Error getting pool address ({dex_type}): {e}")
+            print(f"Error getting pool address ({dex_type}): {e}")
             # If Algebra fails, try Uniswap V3 as fallback
             if dex_type == "algebra_integral":
-                print(f"🔄 Falling back to Uniswap V3 method...")
+                if self.debug_mode:
+                    print("Falling back to Uniswap V3 method...")
                 return self.get_pool_address(token0, token1, fee, factory_address, "uniswap_v3")
             return None
 
-    def fetch_positions_from_dex(self, wallet_address, dex_config):
+    def fetch_positions_from_dex(self, wallet_address, dex_config, suppress_output=False, force_full=False):
         """Fetch LP positions from a specific DEX with fee tracking"""
         dex_name = dex_config["name"]
         position_manager_address = dex_config["position_manager"]
@@ -408,9 +649,11 @@ class BlockchainManager:
         
         positions = []
         
-        print(f"\n🏪 Checking {dex_name} ({dex_type})...")
+        if not suppress_output:
+            print(f"\nChecking {dex_name} ({dex_type})...")
         
         try:
+            self._throttle_rpc()
             position_manager = self.w3.eth.contract(
                 address=Web3.to_checksum_address(position_manager_address),
                 abi=POSITION_MANAGER_ABI
@@ -420,7 +663,8 @@ class BlockchainManager:
             factory_address = None
             try:
                 factory_address = position_manager.functions.factory().call()
-                print(f"🏭 {dex_name} Factory: {factory_address}")
+                if self.debug_mode and not suppress_output:
+                    print(f"Factory: {factory_address}")
                 
                 # Auto-detect DEX type if not specified
                 if dex_type == "uniswap_v3" and dex_name.lower() in ["gliquid", "quickswap"]:
@@ -432,32 +676,116 @@ class BlockchainManager:
             except Exception as e:
                 print(f"⚠️  Could not get factory address from {dex_name} position manager: {e}")
             
-            # Get number of positions owned by wallet
-            balance = position_manager.functions.balanceOf(wallet_address).call()
-            print(f"📋 Found {balance} LP NFT(s) in {dex_name}")
+            # Event-driven refresh: try to detect changes since last scan
+            latest_block = int(self._rl_call(lambda: self.w3.eth.block_number))
+            start_block = self._last_event_block_by_dex.get(dex_name, max(latest_block - 2400, 0))  # ~5-10 min window
+
+            changes_detected = False
+            logs_ok = True
+            try:
+                logs_transfer = self._rl_call(self.w3.eth.get_logs, {
+                    'fromBlock': start_block,
+                    'toBlock': latest_block,
+                    'address': Web3.to_checksum_address(position_manager_address),
+                    'topics': [self._topic_transfer, None, None]
+                })
+                logs_liq_inc = self._rl_call(self.w3.eth.get_logs, {
+                    'fromBlock': start_block,
+                    'toBlock': latest_block,
+                    'address': Web3.to_checksum_address(position_manager_address),
+                    'topics': [self._topic_increase]
+                })
+                logs_liq_dec = self._rl_call(self.w3.eth.get_logs, {
+                    'fromBlock': start_block,
+                    'toBlock': latest_block,
+                    'address': Web3.to_checksum_address(position_manager_address),
+                    'topics': [self._topic_decrease]
+                })
+                changes_detected = bool(logs_transfer or logs_liq_inc or logs_liq_dec)
+
+                # Build event hints for this DEX
+                removed_ids = set()
+                added_ids = set()
+                wallet_cs = Web3.to_checksum_address(wallet_address)
+                for lg in (logs_transfer or []):
+                    if not lg.get('topics') or len(lg['topics']) < 4:
+                        continue
+                    from_addr = Web3.to_checksum_address('0x' + lg['topics'][1].hex()[-40:])
+                    to_addr = Web3.to_checksum_address('0x' + lg['topics'][2].hex()[-40:])
+                    token_id = int(lg['topics'][3].hex(), 16)
+                    if from_addr == wallet_cs and to_addr != wallet_cs:
+                        removed_ids.add(token_id)
+                    if to_addr == wallet_cs and from_addr != wallet_cs:
+                        added_ids.add(token_id)
+                self._last_event_hints_by_dex[dex_name] = {
+                    'removed_ids': removed_ids,
+                    'added_ids': added_ids,
+                    'block': latest_block
+                }
+            except Exception:
+                logs_ok = False
+
+            # Update the cursor only if logs were read successfully
+            if logs_ok:
+                self._last_event_block_by_dex[dex_name] = latest_block
+
+            # Maintenance path: if suppress_output is True we are in maintenance mode
+            if (not force_full) and suppress_output and (not changes_detected or not logs_ok):
+                # Return None sentinel so caller keeps previous positions for this DEX
+                return None
+
+            # Get number of positions owned by wallet (heavy scan)
+            balance = self._rl_call(position_manager.functions.balanceOf(wallet_address).call)
+            if not suppress_output:
+                print(f"Found {balance} LP NFT(s) in {dex_name}")
             
             if balance == 0:
                 return positions
             
             # Show progress for large numbers of positions
-            if balance > 10:
-                print(f"⏳ Scanning {balance} positions (this may take a moment)...")
+            if balance > 10 and not suppress_output:
+                print(f"Scanning {balance} positions (this may take a moment)...")
             
             positions_added = 0
             positions_skipped = 0
+            had_errors = False
+
+            # Simple retry helper for rate-limit bursts
+            def _retry_call(fn, *args, **kwargs):
+                last_exc = None
+                for attempt in range(3):
+                    try:
+                        return fn(*args, **kwargs)
+                    except Exception as e:
+                        last_exc = e
+                        time.sleep(0.4 * (2 ** attempt))
+                raise last_exc
             
             # Get each position
             for i in range(balance):
                 try:
                     # Show progress for large scans
                     if balance > 20 and (i + 1) % 10 == 0:
-                        print(f"📊 Progress: {i + 1}/{balance} positions scanned...")
+                        if not suppress_output:
+                            print(f"Progress: {i + 1}/{balance} positions scanned...")
                     
                     # Get token ID
-                    token_id = position_manager.functions.tokenOfOwnerByIndex(wallet_address, i).call()
+                    try:
+                        token_id = _retry_call(lambda: self._rl_call(position_manager.functions.tokenOfOwnerByIndex(wallet_address, i).call))
+                    except Exception as e:
+                        had_errors = True
+                        if not suppress_output:
+                            print(f"Error fetching {dex_name} position index {i}: {e}")
+                        continue
                     
                     # Get position details (single RPC call)
-                    position_data = position_manager.functions.positions(token_id).call()
+                    try:
+                        position_data = _retry_call(lambda: self._rl_call(position_manager.functions.positions(token_id).call))
+                    except Exception as e:
+                        had_errors = True
+                        if not suppress_output:
+                            print(f"Error fetching {dex_name} position {i}: {e}")
+                        continue
                     
                     # Extract basic info
                     liquidity = position_data[7]
@@ -465,8 +793,8 @@ class BlockchainManager:
                     # FAST CHECK: Skip positions with no liquidity BEFORE expensive operations
                     if liquidity == 0:
                         positions_skipped += 1
-                        # Only show detailed skipping info if balance is small
-                        if balance <= 20:
+                        # Only show detailed skipping info in debug mode to avoid clutter
+                        if self.debug_mode and balance <= 20 and not suppress_output:
                             print(f"⚠️  {dex_name} position #{token_id} has no liquidity, skipping")
                         continue
                     
@@ -507,17 +835,27 @@ class BlockchainManager:
                     
                     positions.append(position)
                     positions_added += 1
-                    print(f"✅ Added {dex_name}: {position['name']} (Token ID: {token_id})")
+                    if self.debug_mode and not suppress_output:
+                        print(f"Added {dex_name}: {position['name']} (Token ID: {token_id})")
                     
                 except Exception as e:
-                    print(f"❌ Error fetching {dex_name} position {i}: {e}")
+                    print(f"Error fetching {dex_name} position {i}: {e}")
                     if self.debug_mode:
                         import traceback
                         traceback.print_exc()
             
+            # Record scan status for this dex
+            self._last_scan_status_by_dex[dex_name] = {
+                'expected': int(balance),
+                'fetched': int(positions_added),
+                'skipped_empty': int(positions_skipped),
+                'had_errors': bool(had_errors),
+                'timestamp': int(time.time())
+            }
+
             # Show DEX summary
-            if positions_skipped > 0:
-                print(f"📊 {dex_name} Summary: {positions_added} active, {positions_skipped} empty positions skipped")
+            if not suppress_output:
+                print(f"Summary: {positions_added} active, {positions_skipped} empty positions skipped")
                     
         except Exception as e:
             print(f"❌ Error accessing {dex_name} position manager: {e}")
@@ -525,8 +863,21 @@ class BlockchainManager:
             if self.debug_mode:
                 import traceback
                 traceback.print_exc()
+            self._last_scan_status_by_dex[dex_name] = {
+                'expected': 0,
+                'fetched': 0,
+                'skipped_empty': 0,
+                'had_errors': True,
+                'timestamp': int(time.time())
+            }
         
         return positions
+
+    def get_last_scan_status(self, dex_name):
+        return self._last_scan_status_by_dex.get(dex_name, None)
+
+    def get_last_event_hints(self, dex_name):
+        return self._last_event_hints_by_dex.get(dex_name, {'removed_ids': set(), 'added_ids': set()})
 
     def get_live_liquidity(self, position):
         """Get current on-chain liquidity for a position"""
@@ -542,6 +893,56 @@ class BlockchainManager:
         except Exception as e:
             print(f"⚠️  Error checking live liquidity for {position['name']}: {e}")
             return position["liquidity"]  # Fallback to cached value
+
+    def get_position_acquired_timestamp(self, token_id, position_manager_address, wallet_address):
+        """Return UNIX timestamp when the current wallet acquired this tokenId.
+        Uses Transfer(to=wallet, tokenId) last occurrence; cached to avoid repeated calls.
+        """
+        cache_key = (int(token_id), Web3.to_checksum_address(position_manager_address), Web3.to_checksum_address(wallet_address))
+        if cache_key in self._acquired_ts_cache:
+            return self._acquired_ts_cache[cache_key]
+
+        try:
+            id_topic = '0x' + int(token_id).to_bytes(32, 'big').hex()
+            # Fetch all Transfer logs for this tokenId (no 'to' filter to avoid provider quirks)
+            logs = self._rl_call(self.w3.eth.get_logs, {
+                'fromBlock': 0,
+                'toBlock': 'latest',
+                'address': Web3.to_checksum_address(position_manager_address),
+                'topics': [self._topic_transfer, None, None, id_topic]
+            })
+            wallet_norm = Web3.to_checksum_address(wallet_address)
+            # Walk from newest to oldest to find last time it was transferred to the wallet
+            for lg in reversed(list(logs) if logs else []):
+                if not lg.get('topics') or len(lg['topics']) < 4:
+                    continue
+                try:
+                    to_addr = Web3.to_checksum_address('0x' + lg['topics'][2].hex()[-40:])
+                except Exception:
+                    continue
+                if to_addr == wallet_norm:
+                    block_num = lg['blockNumber']
+                    block = self._rl_call(self.w3.eth.get_block, int(block_num))
+                    ts = int(block['timestamp'])
+                    self._acquired_ts_cache[cache_key] = ts
+                    return ts
+            # Fallback: first IncreaseLiquidity for this token (often emitted at mint)
+            inc_logs = self._rl_call(self.w3.eth.get_logs, {
+                'fromBlock': 0,
+                'toBlock': 'latest',
+                'address': Web3.to_checksum_address(position_manager_address),
+                'topics': [self._topic_increase, None, None, id_topic]
+            })
+            if inc_logs:
+                first = inc_logs[0]
+                block_num = first['blockNumber']
+                block = self._rl_call(self.w3.eth.get_block, block_num)
+                ts = int(block['timestamp'])
+                self._acquired_ts_cache[cache_key] = ts
+                return ts
+        except Exception:
+            pass
+        return None
 
     def check_position_status(self, position, wallet_address):
         """Check position status with fee tracking"""
@@ -582,6 +983,8 @@ class BlockchainManager:
         
         # Get unclaimed fees
         fee_data = self.get_unclaimed_fees(position, wallet_address)
+        # Get acquisition timestamp
+        acquired_ts = self.get_position_acquired_timestamp(position['token_id'], position['position_manager'], wallet_address)
         
         return {
             "in_range": in_range,
@@ -609,5 +1012,6 @@ class BlockchainManager:
             "fee_amount0_wei": fee_data["fee_amount0_wei"],
             "fee_amount1_wei": fee_data["fee_amount1_wei"],
             "has_unclaimed_fees": fee_data["has_fees"],
-            "fee_error": fee_data.get("error")
+            "fee_error": fee_data.get("error"),
+            "acquired_timestamp": acquired_ts
         }

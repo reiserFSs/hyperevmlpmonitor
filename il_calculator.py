@@ -3,7 +3,7 @@
 Impermanent Loss Calculator Module for HyperEVM LP Monitor
 Calculates IL and provides intelligent rebalancing recommendations
 
-Version: 1.4.1 (IL Detection)
+Version: 1.5.0 (IL Detection)
 Developer: 8roku8.hl
 """
 

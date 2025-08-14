@@ -121,16 +121,31 @@ def calculate_position_value_usd(position, status, token_prices):
     return total_usd if has_price else None
 
 def format_usd_value(value):
-    """Format USD value with appropriate precision"""
+    """Format USD value with appropriate precision.
+
+    Uses thresholds based on absolute value, but preserves the sign in the
+    rendered number so that negative values get the same precision as positive
+    ones (fixes cases like $-42.190047 showing too many decimals).
+    """
     if value is None:
         return ""
-    elif value >= 1000000:
-        return f"${value/1000000:.2f}M"
-    elif value >= 1000:
-        return f"${value:,.0f}"
-    elif value >= 1:
-        return f"${value:,.2f}"
-    elif value >= 0.01:
-        return f"${value:.4f}"
+
+    abs_val = abs(value)
+
+    # Pick the formatted magnitude using the absolute value, but format with
+    # the correct sign so the currency symbol stays in front of the number.
+    if abs_val >= 1_000_000:
+        display_val = -abs_val/1_000_000 if value < 0 else abs_val/1_000_000
+        return f"${display_val:.2f}M"
+    elif abs_val >= 1_000:
+        display_val = -abs_val if value < 0 else abs_val
+        return f"${display_val:,.0f}"
+    elif abs_val >= 1:
+        display_val = -abs_val if value < 0 else abs_val
+        return f"${display_val:,.2f}"
+    elif abs_val >= 0.01:
+        display_val = -abs_val if value < 0 else abs_val
+        return f"${display_val:.4f}"
     else:
-        return f"${value:.6f}"
+        display_val = -abs_val if value < 0 else abs_val
+        return f"${display_val:.6f}"

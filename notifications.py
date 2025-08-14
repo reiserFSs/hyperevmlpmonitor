@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
 Notification Management Module for HyperEVM LP Monitor
-Handles all notification methods: Telegram, Discord, Pushover, Email
+Handles Telegram & Discord
 
-COMPLETE UPDATED VERSION: Per-position cooldowns + state cleanup + fee information
-
-Version: 1.4.1 (Complete with State Cleanup + Fee Information)
+Version: 1.5.0 (Complete with State Cleanup + Fee Information)
 Developer: 8roku8.hl
 """
 
@@ -25,6 +23,18 @@ from utils import (
     is_full_range_position, format_fees_display, has_significant_fees
 )
 
+# Optional USD formatter
+try:
+    from price_utils import format_usd_value
+    PRICE_FORMAT_AVAILABLE = True
+except ImportError:
+    PRICE_FORMAT_AVAILABLE = False
+    def format_usd_value(v):
+        try:
+            return f"${float(v):,.2f}"
+        except Exception:
+            return str(v)
+
 class NotificationManager:
     """Unified notification management with smart per-position cooldowns"""
     
@@ -37,6 +47,13 @@ class NotificationManager:
         self.include_fees = config.get("notifications", {}).get("include_fees_in_notifications", True)
         self.include_il = config.get("notifications", {}).get("include_il_in_notifications", True)
         
+        # Optional database for portfolio metrics
+        self.db = None
+        try:
+            from position_database import PositionDatabase
+            self.db = PositionDatabase()
+        except Exception:
+            self.db = None
         # Per-position state tracking for smart cooldowns
         self.position_states_file = "position_notification_states.json"
         self.position_states = self.load_position_states()
@@ -111,10 +128,6 @@ class NotificationManager:
                 self.setup_telegram()
             elif self.notification_type == "discord":
                 self.setup_discord()
-            elif self.notification_type == "pushover":
-                self.setup_pushover()
-            elif self.notification_type == "email":
-                self.setup_email()
             else:
                 print(f"❌ Unknown notification type: {self.notification_type}")
                 self.enabled = False
@@ -131,11 +144,11 @@ class NotificationManager:
             self.enabled = False
             return
         
-        print("🔍 Testing Telegram bot connection...")
+        print("Testing Telegram bot connection...")
         if self.test_telegram():
-            print("✅ Telegram bot connected successfully!")
+            print("Telegram bot connected successfully")
         else:
-            print("❌ Telegram bot connection failed")
+            print("Telegram bot connection failed")
             self.enabled = False
 
     def setup_discord(self):
@@ -147,64 +160,16 @@ class NotificationManager:
             self.enabled = False
             return
         
-        print("🔍 Testing Discord webhook...")
+        print("Testing Discord webhook...")
         if self.test_discord():
-            print("✅ Discord webhook connected successfully!")
+            print("Discord webhook connected successfully")
         else:
-            print("❌ Discord webhook connection failed")
+            print("Discord webhook connection failed")
             self.enabled = False
 
-    def setup_pushover(self):
-        """Setup Pushover notifications"""
-        pushover_config = self.config["notifications"]["pushover"]
-        
-        if not pushover_config.get("user_key") or not pushover_config.get("api_token"):
-            print("❌ Pushover user key or API token not configured")
-            self.enabled = False
-            return
-        
-        print("🔍 Testing Pushover connection...")
-        if self.test_pushover():
-            print("✅ Pushover connected successfully!")
-        else:
-            print("❌ Pushover connection failed")
-            self.enabled = False
+    # Pushover setup removed
 
-    def setup_email(self):
-        """Setup email credentials securely"""
-        try:
-            email_config = self.config["notifications"]["email"]
-            if not email_config.get("email_address"):
-                print("❌ Email address not configured")
-                self.enabled = False
-                return
-            
-            print("🔐 Email password required for notifications")
-            print(f"Email: {email_config['email_address']}")
-            print("⚠️  Note: Many providers have deprecated app passwords")
-            
-            # Securely prompt for password
-            self.email_password = getpass.getpass("Enter email password: ")
-            
-            if not self.email_password:
-                print("⚠️  No password provided, disabling notifications")
-                self.enabled = False
-                return
-            
-            # Test email connection
-            print("🔍 Testing email connection...")
-            if self.test_email_connection():
-                print("✅ Email connection successful!")
-            else:
-                print("❌ Email connection failed, disabling notifications")
-                self.enabled = False
-                
-        except KeyboardInterrupt:
-            print("\n⚠️  Email setup cancelled, disabling notifications")
-            self.enabled = False
-        except Exception as e:
-            print(f"❌ Email setup error: {e}")
-            self.enabled = False
+    # Email setup removed
 
     def test_telegram(self):
         """Test Telegram bot connection"""
@@ -242,36 +207,9 @@ class NotificationManager:
             print(f"Discord test failed: {e}")
             return False
 
-    def test_pushover(self):
-        """Test Pushover connection"""
-        try:
-            pushover_config = self.config["notifications"]["pushover"]
-            
-            data = {
-                "token": pushover_config["api_token"],
-                "user": pushover_config["user_key"],
-                "message": "HyperEVM LP Monitor connected successfully!"
-            }
-            
-            response = requests.post("https://api.pushover.net/1/messages.json", data=data, timeout=10)
-            return response.status_code == 200
-        except Exception as e:
-            print(f"Pushover test failed: {e}")
-            return False
+    # Pushover test removed
 
-    def test_email_connection(self):
-        """Test SMTP connection"""
-        try:
-            email_config = self.config["notifications"]["email"]
-            
-            server = smtplib.SMTP(email_config["smtp_server"], email_config["smtp_port"])
-            server.starttls()
-            server.login(email_config["email_address"], self.email_password)
-            server.quit()
-            return True
-        except Exception as e:
-            print(f"Email test failed: {e}")
-            return False
+    # Email SMTP test removed
 
     def should_send_notification(self):
         """Check if we should send notification based on cooldown"""
@@ -303,7 +241,7 @@ class NotificationManager:
         # Always notify on status changes
         if last_status != current_status_type:
             if debug_mode:
-                print(f"🔍 Position {position_key}: Status changed {last_status} → {current_status_type}")
+                print(f"Position {position_key}: Status changed {last_status} -> {current_status_type}")
             return True
         
         # For same status, check cooldown
@@ -313,12 +251,12 @@ class NotificationManager:
         time_since_last = current_time - last_notification_time
         if time_since_last >= cooldown_duration:
             if debug_mode:
-                print(f"🔍 Position {position_key}: Cooldown expired ({time_since_last:.0f}s >= {cooldown_duration}s)")
+                print(f"Position {position_key}: Cooldown expired ({time_since_last:.0f}s >= {cooldown_duration}s)")
             return True
         
         if debug_mode:
             remaining_cooldown = cooldown_duration - time_since_last
-            print(f"🔍 Position {position_key}: In cooldown ({remaining_cooldown:.0f}s remaining)")
+            print(f"Position {position_key}: In cooldown ({remaining_cooldown:.0f}s remaining)")
         
         return False
 
@@ -348,9 +286,11 @@ class NotificationManager:
             elif self.notification_type == "discord":
                 return self.send_discord(message, title)
             elif self.notification_type == "pushover":
-                return self.send_pushover(message, title)
+                print("❌ Pushover notifications are no longer supported")
+                return False
             elif self.notification_type == "email":
-                return self.send_email_notification(title, message)
+                print("❌ Email notifications are no longer supported")
+                return False
             return False
         except Exception as e:
             print(f"❌ Failed to send notification: {e}")
@@ -403,56 +343,9 @@ class NotificationManager:
             print(f"Discord send failed: {e}")
             return False
 
-    def send_pushover(self, message, title):
-        """Send Pushover notification"""
-        try:
-            pushover_config = self.config["notifications"]["pushover"]
-            
-            data = {
-                "token": pushover_config["api_token"],
-                "user": pushover_config["user_key"],
-                "title": title,
-                "message": message,
-                "priority": 1  # High priority
-            }
-            
-            response = requests.post("https://api.pushover.net/1/messages.json", data=data, timeout=10)
-            return response.status_code == 200
-        except Exception as e:
-            print(f"Pushover send failed: {e}")
-            return False
+    # Pushover sender removed
 
-    def send_email_notification(self, subject, body):
-        """Send email notification"""
-        if not self.enabled or self.notification_type != "email":
-            return False
-        
-        try:
-            email_config = self.config["notifications"]["email"]
-            
-            # Create message
-            msg = MIMEMultipart()
-            msg['From'] = email_config["email_address"]
-            msg['To'] = email_config["recipient_email"]
-            msg['Subject'] = subject
-            
-            # Add body
-            msg.attach(MIMEText(body, 'plain'))
-            
-            # Send email
-            server = smtplib.SMTP(email_config["smtp_server"], email_config["smtp_port"])
-            server.starttls()
-            server.login(email_config["email_address"], self.email_password)
-            
-            text = msg.as_string()
-            server.sendmail(email_config["email_address"], email_config["recipient_email"], text)
-            server.quit()
-            
-            return True
-            
-        except Exception as e:
-            print(f"❌ Failed to send email: {e}")
-            return False
+    # Email sender removed
 
     def analyze_positions(self, position_statuses):
         """Analyze positions and determine what should be notified"""
@@ -586,14 +479,14 @@ class NotificationManager:
             return
         
         if debug_mode:
-            print("🔍 ANALYZING POSITIONS for smart notifications...")
+            print("Analyzing positions for smart notifications...")
         
         # Analyze which positions need notification
         positions_to_notify, safe_count, warning_count, danger_count, out_of_range_count = self.analyze_positions(position_statuses)
         
         if not positions_to_notify:
             if debug_mode:
-                print("🔍 No positions need notification (all in cooldown)")
+                print("No positions need notification (all in cooldown)")
             return
         
         # Check if we should send based on issues-only setting
@@ -602,18 +495,18 @@ class NotificationManager:
         
         if notify_on_issues_only and not has_issues:
             if debug_mode:
-                print("🔍 No issues found and notify_on_issues_only is enabled, skipping notification")
+                print("No issues found and notify_on_issues_only is enabled, skipping notification")
             return
         
         # Debug cooldown status
         if debug_mode:
-            print(f"🔍 Total positions: {len(position_statuses)}")
-            print(f"🔍 Positions to notify: {len(positions_to_notify)}")
+            print(f"Total positions: {len(position_statuses)}")
+            print(f"Positions to notify: {len(positions_to_notify)}")
             for position, status in position_statuses:
                 if status:
                     position_key = self.get_position_key(position)
                     stored_state = self.position_states.get(position_key, {})
-                    print(f"🔍 {position['name']}: last_status={stored_state.get('last_status', 'none')}, cooldown_check=...")
+                    print(f"{position['name']}: last_status={stored_state.get('last_status', 'none')}, cooldown_check=...")
         
         # Smart truncation for many positions
         total_positions = len(position_statuses)
@@ -626,18 +519,25 @@ class NotificationManager:
         else:
             title = f"LP Portfolio Status ({len(positions_to_notify)} updates)"
         
+        # Build portfolio line from current status if DB available
+        portfolio_line = self._build_portfolio_line(position_statuses, wallet_address)
+
         # Create notification message
         if self.notification_type == "telegram":
             message = self.format_telegram_message(
                 positions_to_notify, issue_positions, safe_positions,
                 total_positions, safe_count, warning_count, danger_count, out_of_range_count,
-                wallet_address
+                wallet_address,
+                portfolio_line,
+                position_statuses
             )
         else:
             message = self.format_standard_message(
                 positions_to_notify, issue_positions, safe_positions,
                 total_positions, safe_count, warning_count, danger_count, out_of_range_count,
-                wallet_address
+                wallet_address,
+                portfolio_line,
+                position_statuses
             )
         
         if self.send_notification(message, title):
@@ -647,99 +547,151 @@ class NotificationManager:
         else:
             print(f"❌ Failed to send {self.notification_type} notification")
 
-    def format_telegram_message(self, positions_to_notify, issue_positions, safe_positions, 
-                              total_positions, safe_count, warning_count, danger_count, out_of_range_count, wallet_address):
-        """Format Telegram message with smart truncation and fee information"""
+    def _build_portfolio_line(self, position_statuses, wallet_address):
+        """Compute a concise portfolio performance line using the database and current prices."""
+        try:
+            # Lazy import to avoid hard dependency issues
+            from price_utils import extract_token_prices_from_positions
+        except ImportError:
+            return None
+
+        if not self.db:
+            return None
+
+        try:
+            token_prices = extract_token_prices_from_positions(position_statuses)
+            if not token_prices:
+                return None
+
+            total_value = 0
+            total_pnl = 0
+            total_il = 0
+            total_fees = 0
+
+            for position, status in position_statuses:
+                if not status:
+                    continue
+                metrics = self.db.calculate_pnl_metrics(position, status, wallet_address, token_prices)
+                if not metrics:
+                    continue
+                total_value += metrics['current_value_usd']
+                total_pnl += metrics['pnl_usd']
+                total_il += metrics['il_usd']
+                total_fees += metrics['total_fees_earned_usd']
+
+            if total_value <= 0:
+                return None
+
+            pnl_pct = (total_pnl / total_value * 100)
+            il_pct = (total_il / total_value * 100)
+            return (
+                f"Value {format_usd_value(total_value)} • PnL {format_usd_value(total_pnl)} ({pnl_pct:+.1f}%) "
+                f"• IL {format_usd_value(total_il)} ({il_pct:+.1f}%) • Fees {format_usd_value(total_fees)}"
+            )
+        except Exception:
+            return None
+
+    def format_telegram_message(self, positions_to_notify, issue_positions, safe_positions,
+                                total_positions, safe_count, warning_count, danger_count, out_of_range_count, wallet_address,
+                                portfolio_line=None, position_statuses=None):
+        """Sleeker Telegram message with portfolio performance and fewer icons."""
         message_parts = []
-        
-        # Summary
-        message_parts.append(f"<b>📊 Portfolio Summary ({total_positions} total positions)</b>")
-        message_parts.append("")
-        
-        if out_of_range_count > 0:
-            message_parts.append(f"❌ <b>{out_of_range_count}</b> OUT OF RANGE")
-        if danger_count > 0:
-            message_parts.append(f"🚨 <b>{danger_count}</b> DANGER ZONE")
-        if warning_count > 0:
-            message_parts.append(f"⚠️ <b>{warning_count}</b> WARNING ZONE")
-        if safe_count > 0:
-            message_parts.append(f"✅ <b>{safe_count}</b> SAFE")
-        
-        # Show cooldown info if some positions are not displayed
+
+        # Header
+        attention = len(issue_positions)
+        message_parts.append(f"<b>LP Update</b> — {attention} needing attention • {total_positions} total")
+        if portfolio_line:
+            message_parts.append(portfolio_line)
+
+        # Portfolio performance (if DB available)
+        try:
+            from position_database import PositionDatabase
+            db = PositionDatabase()
+            # We don't have the wallet here for aggregated calc beyond current session; include counts only
+            # Keep this minimal to avoid heavy DB ops; rely on counts and categories
+        except Exception:
+            db = None
+
+        # Status breakdown (minimal text)
+        lines = []
+        if out_of_range_count:
+            lines.append(f"{out_of_range_count} out of range")
+        if danger_count:
+            lines.append(f"{danger_count} danger")
+        if warning_count:
+            lines.append(f"{warning_count} warning")
+        if safe_count:
+            lines.append(f"{safe_count} safe")
+        if lines:
+            message_parts.append(" • ".join(lines))
+
+        # Cooldown info
         total_notifiable = len(positions_to_notify)
         if total_notifiable < total_positions:
             cooldown_count = total_positions - total_notifiable
-            message_parts.append(f"⏰ <i>{cooldown_count} position(s) in notification cooldown</i>")
-        
+            message_parts.append(f"{cooldown_count} position(s) in cooldown")
+
         message_parts.append("")
-        
-        # Smart truncation: Show up to 6 issue positions in detail
+
+        # Positions needing attention — show up to 5
         if issue_positions:
-            message_parts.append(f"<b>🚨 Positions Needing Attention (Updated):</b>")
-            
-            positions_to_show = issue_positions[:6]  # Smart limit
-            for pos_data in positions_to_show:
-                details = self.format_position_details(pos_data)
-                message_parts.append(f"<b>{details['header']}</b>")
-                message_parts.append(f"    💼 Position: {details['position_amount']}")
-                message_parts.append(f"    💰 Price: {details['price']}")
-                message_parts.append(f"    📊 Range: {details['range_info']}")
-                if details["buffer_info"]:
-                    message_parts.append(f"    🎯 Buffer: {details['buffer_info']}")
-                # Add fee information if available
-                if self.include_fees and "fees" in details:
-                    message_parts.append(f"    💸 Fees: {details['fees']}")
-                # Add IL information if available
-                if self.include_il and "il_analysis" in details:
-                    message_parts.append(f"    📊 IL: {details['il_analysis']}")
-                    message_parts.append(f"    🎯 Efficiency: {details['efficiency']}")
-                    message_parts.append(f"    🔄 Rebalance: {details['rebalance_needed']}")
+            message_parts.append("<b>Positions Needing Attention</b>")
+            for pos_data in issue_positions[:5]:
+                d = self.format_position_details(pos_data)
+                message_parts.append(f"<b>{d['header']}</b>")
+                message_parts.append(f"  Position: {d['position_amount']}")
+                message_parts.append(f"  Price: {d['price']}")
+                message_parts.append(f"  Range: {d['range_info']}")
+                if d.get("buffer_info"):
+                    message_parts.append(f"  Buffer: {d['buffer_info']}")
+                if self.include_fees and "fees" in d:
+                    message_parts.append(f"  Fees: {d['fees']}")
+                if self.include_il and "il_analysis" in d:
+                    message_parts.append(f"  IL: {d['il_analysis']}")
+                    message_parts.append(f"  Efficiency: {d['efficiency']}")
                 message_parts.append("")
-            
-            # Show summary for remaining positions
-            if len(issue_positions) > 6:
-                remaining = len(issue_positions) - 6
-                message_parts.append(f"<i>... and {remaining} more positions needing attention</i>")
+            if len(issue_positions) > 5:
+                message_parts.append(f"…and {len(issue_positions) - 5} more")
                 message_parts.append("")
-        
-        # Safe positions - show up to 3 in detail, then summarize
-        if safe_positions:
-            if len(safe_positions) <= 3:
-                message_parts.append(f"<b>✅ Safe Positions (Updated):</b>")
-                for pos_data in safe_positions:
-                    details = self.format_position_details(pos_data)
-                    message_parts.append(f"<b>{details['header']}</b>")
-                    message_parts.append(f"    💼 Position: {details['position_amount']}")
-                    message_parts.append(f"    💰 Price: {details['price']}")
-                    message_parts.append(f"    📊 Range: {details['range_info']}")
-                    if details["buffer_info"]:
-                        message_parts.append(f"    🎯 Buffer: {details['buffer_info']}")
-                    # Add fee information if available
-                    if self.include_fees and "fees" in details:
-                        message_parts.append(f"    💸 Fees: {details['fees']}")
-                    # Add IL information if available
-                    if self.include_il and "il_analysis" in details:
-                        message_parts.append(f"    📊 IL: {details['il_analysis']}")
-                        message_parts.append(f"    🎯 Efficiency: {details['efficiency']}")
-                    message_parts.append("")
-            else:
-                message_parts.append(f"<b>✅ {len(safe_positions)} safe positions updated</b>")
+
+        # Safe details (up to 3) when there are no issues
+        if safe_positions and len(issue_positions) == 0:
+            to_show = safe_positions[:3]
+            message_parts.append("<b>Safe Positions</b>")
+            for pos_data in to_show:
+                d = self.format_position_details(pos_data)
+                message_parts.append(f"<b>{d['header']}</b>")
+                message_parts.append(f"  Position: {d['position_amount']}")
+                message_parts.append(f"  Price: {d['price']}")
+                message_parts.append(f"  Range: {d['range_info']}")
+                if d.get("buffer_info"):
+                    message_parts.append(f"  Buffer: {d['buffer_info']}")
+                if self.include_fees and "fees" in d:
+                    message_parts.append(f"  Fees: {d['fees']}")
+                if self.include_il and "il_analysis" in d:
+                    message_parts.append(f"  IL: {d['il_analysis']}")
                 message_parts.append("")
-        
-        # Footer
-        message_parts.append(f"<b>Wallet:</b> <code>{wallet_address}</code>")
-        message_parts.append(f"<i>HyperEVM LP Monitor v{VERSION}</i>")
-        message_parts.append(f"<i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>")
-        
+            if len(safe_positions) > 3:
+                message_parts.append(f"…and {len(safe_positions)-3} more safe positions")
+                message_parts.append("")
+
+        # Footer with wallet and timestamp
+        message_parts.append(f"Wallet: <code>{wallet_address}</code>")
+        message_parts.append(f"HyperEVM LP Monitor v{VERSION}")
+        message_parts.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
         return "\n".join(message_parts)
 
     def format_standard_message(self, positions_to_notify, issue_positions, safe_positions,
-                              total_positions, safe_count, warning_count, danger_count, out_of_range_count, wallet_address):
+                              total_positions, safe_count, warning_count, danger_count, out_of_range_count, wallet_address,
+                              portfolio_line=None, position_statuses=None):
         """Format standard message for Discord/Pushover/Email with smart truncation and fee information"""
         message_parts = []
         
         # Summary
         message_parts.append(f"📊 Portfolio Summary ({total_positions} total positions)")
+        if portfolio_line:
+            message_parts.append(portfolio_line)
         message_parts.append("")
         
         if out_of_range_count > 0:
@@ -851,4 +803,4 @@ class NotificationManager:
         message = "\n".join(message_parts)
         
         if self.send_notification(message, title):
-            print("🔔 Portfolio update notification sent")
+            print("Portfolio update notification sent")

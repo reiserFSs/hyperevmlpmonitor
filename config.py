@@ -6,7 +6,7 @@ Handles loading, saving, and setup of LP monitor configuration
 UPDATED VERSION: Smart notification setup with per-position cooldowns + Fee tracking + Rich UI
 
 Version: 1.5.0 (Smart Notifications + Fee Tracking + Rich UI)
-Developer: 8roku8.hl + Claude
+Developer: 8roku8.hl
 """
 
 import json
@@ -291,6 +291,21 @@ def setup_optional_settings(config):
     else:
         config["display_settings"]["show_unclaimed_fees"] = True
         print("💰 Fee tracking enabled - will show unclaimed fees")
+
+    # PnL/IL tracking settings
+    pnl_input = input(f"\nEnable PnL/IL tracking with a local database? (y/n, default: y): ").strip().lower()
+    if pnl_input in ['n', 'no']:
+        config.setdefault("pnl_settings", {})["enabled"] = False
+        print("📉 PnL/IL tracking disabled")
+    else:
+        config.setdefault("pnl_settings", {})["enabled"] = True
+        print("📈 PnL/IL tracking enabled")
+        # Database path customization
+        db_path = input("Database file path (default: lp_positions.db): ").strip()
+        if db_path:
+            config["pnl_settings"]["database_path"] = db_path
+        include_il = input("Include IL metrics in tables and notifications? (y/n, default: y): ").strip().lower()
+        config["pnl_settings"]["include_il_metrics"] = not (include_il in ['n', 'no'])
     
     # Debug mode
     debug_input = input(f"\nEnable debug mode for troubleshooting? (y/n): ").strip().lower()
@@ -331,19 +346,13 @@ def setup_notifications(config):
     print(f"\n📋 Choose your notification method:")
     print("1. 🤖 Telegram Bot (Recommended - Free, secure, instant)")
     print("2. 💬 Discord Webhook (Free, simple setup)")
-    print("3. 📱 Pushover (Push notifications, $5 one-time)")
-    print("4. 📧 Email (Traditional, may have setup issues)")
     
-    choice = input("Enter choice (1-4): ").strip()
+    choice = input("Enter choice (1-2): ").strip()
     
     if choice == "1":
         config = setup_telegram_notifications(config)
     elif choice == "2":
         config = setup_discord_notifications(config)
-    elif choice == "3":
-        config = setup_pushover_notifications(config)
-    elif choice == "4":
-        config = setup_email_notifications(config)
     
     # Smart notification preferences
     config = setup_smart_notification_preferences(config)
@@ -392,6 +401,11 @@ def setup_smart_notification_preferences(config):
         else:
             config["notifications"]["include_fees_in_notifications"] = True
             print("💰 Fee information will be included in notifications")
+
+    # Include IL in notifications
+    if config.get("pnl_settings", {}).get("enabled", True) and config.get("pnl_settings", {}).get("include_il_metrics", True):
+        include_il = input("Include IL information in notifications? (y/n, default: y): ").strip().lower()
+        config["notifications"]["include_il_in_notifications"] = not (include_il in ['n', 'no'])
     
     # Issues-only mode (still useful for very conservative users)
     issues_only = input("\nOnly notify about problems (skip all safe position updates)? (y/n, default: n): ").strip().lower()
@@ -481,41 +495,5 @@ def setup_discord_notifications(config):
     webhook_url = input(f"\nEnter Discord webhook URL: ").strip()
     if webhook_url:
         config["notifications"]["discord"]["webhook_url"] = webhook_url
-    
-    return config
-
-def setup_pushover_notifications(config):
-    """Setup Pushover notifications"""
-    config["notifications"]["type"] = "pushover"
-    print(f"\n📱 PUSHOVER SETUP")
-    print("Step 1: Sign up at https://pushover.net ($5 one-time)")
-    print("Step 2: Create an application")
-    print("Step 3: Get your User Key and API Token")
-    
-    user_key = input(f"\nEnter your Pushover User Key: ").strip()
-    if user_key:
-        config["notifications"]["pushover"]["user_key"] = user_key
-        
-    api_token = input("Enter your Pushover API Token: ").strip()
-    if api_token:
-        config["notifications"]["pushover"]["api_token"] = api_token
-    
-    return config
-
-def setup_email_notifications(config):
-    """Setup email notifications"""
-    config["notifications"]["type"] = "email"
-    print(f"\n📧 EMAIL SETUP")
-    print("⚠️  Note: Gmail App Passwords are deprecated. Consider using a different provider.")
-    
-    email_address = input("Your email address: ").strip()
-    if email_address:
-        config["notifications"]["email"]["email_address"] = email_address
-    
-    recipient_email = input("Recipient email (can be same): ").strip()
-    if recipient_email:
-        config["notifications"]["email"]["recipient_email"] = recipient_email
-    else:
-        config["notifications"]["email"]["recipient_email"] = email_address
     
     return config

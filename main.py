@@ -3,18 +3,8 @@
 HyperEVM LP Position Monitor - Main Entry Point
 Multi-DEX liquidity position tracking for HyperEVM
 
-Features:
-- Rich terminal UI with beautiful tables and visualizations
-- Dynamic position tracking (auto-detects new/removed positions)
-- Multi-notification support (Telegram, Discord, Pushover, Email)
-- Real-time price monitoring with DYNAMIC thresholds
-- Multi-DEX support (Uniswap V3, Algebra Integral)
-- Unclaimed fee tracking using static collect() calls
-- Simplified color scheme options
-- Modular architecture for maintainability
-
 Version: 1.5.0 (Modular Architecture + Fee Tracking + Rich UI)
-Developer: 8roku8.hl + Claude
+Developer: 8roku8.hl
 """
 
 import sys

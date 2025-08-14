@@ -4,7 +4,7 @@ Position Database Module for HyperEVM LP Monitor
 Tracks historical position data for PnL and IL calculations
 
 Version: 1.6.0
-Developer: 8roku8.hl + Claude
+Developer: 8roku8.hl
 """
 
 import sqlite3
