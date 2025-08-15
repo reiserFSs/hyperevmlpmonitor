@@ -5,10 +5,11 @@ The main features of this monitor is essentially the notification feature. Let t
 
 # Features
 - Dynamic position tracking (auto-detects new/removed positions)
-- Multi-notification support (Telegram, Discord, Pushover, Email - NOT RECOMMENDED, NO HASHING OF PWS IMPLEMENTED YET, PLUS GOOGLE DOESN'T ALLOW PASSCODES ANYMORE)
+- Multi-notification support (Telegram, Discord)
 - Real-time price monitoring with dynamic thresholds going by tick size
 - Multi-DEX support (Uniswap V3, Algebra Integral)
 - Unclaimed fee tracking
+- PnL / IL tracking
 - Modular architecture for maintainability
 
 # Installation
