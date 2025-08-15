@@ -361,7 +361,7 @@ class BlockchainManager:
                 function_selector = self.w3.keccak(text="globalState()")[:4]
                 raw_result = self.w3.eth.call({
                     'to': pool_address,
-                    'data': function_selector.hex()
+                    'data': '0x' + function_selector.hex()
                 })
                 
                 sqrt_price_x96, current_tick = parse_algebra_raw_data(raw_result, self.debug_mode)
@@ -472,14 +472,12 @@ class BlockchainManager:
         call_index = []  # map index -> (pool, dtype)
         for addr, dtype in normalized:
             selector = slot0_selector if dtype == 'uniswap_v3' else global_selector
-            calls.append((addr, selector.hex()))
+            # Pass bytes selector directly for no-arg calls
+            calls.append((addr, selector))
             call_index.append((addr, dtype))
 
         try:
-            block_num, ret_datas = self._rl_call(self.multicall.functions.aggregate([
-                (addr, bytes.fromhex(data[2:]) if isinstance(data, str) and data.startswith('0x') else data)
-                for addr, data in calls
-            ]).call)
+            block_num, ret_datas = self._rl_call(self.multicall.functions.aggregate(calls).call)
         except Exception:
             return  # silently skip if multicall fails
 
@@ -514,7 +512,6 @@ class BlockchainManager:
         # Batch token0/token1 for all pools
         try:
             pool_min = self.w3.eth.contract(abi=MINIMAL_POOL_ABI, address=Web3.to_checksum_address(list(pool_to_core.keys())[0][0]))
-            calldata_t0 = pool_min.encodeABI(fn_name='token0')[-8:]  # not used; we will encode per pool
         except Exception:
             pool_min = None
 
@@ -1081,19 +1078,11 @@ class BlockchainManager:
                         'fromBlock': search_start,
                         'toBlock': 'latest',
                         'address': position_manager,
-                        'topics': [self._topic_increase]
+                        'topics': [self._topic_increase, id_topic]
                     })
-                    # Find first increase for this token
-                    for lg in logs:
-                        try:
-                            data_bytes = bytes.fromhex(lg['data'][2:]) if isinstance(lg['data'], str) else lg['data']
-                            if len(data_bytes) >= 32:
-                                tok = int.from_bytes(data_bytes[0:32], 'big')
-                                if tok == token_id:
-                                    creation_block = lg['blockNumber']
-                                    break
-                        except Exception:
-                            continue
+                    # First IncreaseLiquidity for this token
+                    if logs:
+                        creation_block = logs[0]['blockNumber']
                 except Exception:
                     pass
                     
@@ -1109,20 +1098,10 @@ class BlockchainManager:
                     'fromBlock': creation_block,
                     'toBlock': creation_block + 10,  # Small range around creation block
                     'address': position_manager,
-                    'topics': [self._topic_increase]
+                    'topics': [self._topic_increase, id_topic]
                 })
                 
-                first_increase = None
-                for lg in logs:
-                    try:
-                        data_bytes = bytes.fromhex(lg['data'][2:]) if isinstance(lg['data'], str) else lg['data']
-                        if len(data_bytes) >= 32:
-                            tok = int.from_bytes(data_bytes[0:32], 'big')
-                            if tok == token_id:
-                                first_increase = lg
-                                break
-                    except Exception:
-                        continue
+                first_increase = logs[0] if logs else None
                         
                 if not first_increase:
                     self._initial_liquidity_cache[cache_key] = None
@@ -1137,10 +1116,12 @@ class BlockchainManager:
             amount0_wei = 0
             amount1_wei = 0
             try:
-                if data_bytes and len(data_bytes) >= 128:
-                    # data layout: [tokenId(32)][liquidity(32)][amount0(32)][amount1(32)]
-                    amount0_wei = int.from_bytes(data_bytes[64:96], 'big')
-                    amount1_wei = int.from_bytes(data_bytes[96:128], 'big')
+                if data_bytes and len(data_bytes) >= 96:
+                    # data layout for IncreaseLiquidity (tokenId is indexed):
+                    # [liquidity(32)][amount0(32)][amount1(32)]
+                    # We only need amounts for entry valuation
+                    amount0_wei = int.from_bytes(data_bytes[32:64], 'big')
+                    amount1_wei = int.from_bytes(data_bytes[64:96], 'big')
             except Exception:
                 amount0_wei = 0
                 amount1_wei = 0
