@@ -5,10 +5,11 @@ The main features of this monitor is essentially the notification feature. Let t
 
 # Features
 - Dynamic position tracking (auto-detects new/removed positions)
-- Multi-notification support (Telegram, Discord, Pushover, Email - NOT RECOMMENDED, NO HASHING OF PWS IMPLEMENTED YET, PLUS GOOGLE DOESN'T ALLOW PASSCODES ANYMORE)
+- Multi-notification support (Telegram, Discord)
 - Real-time price monitoring with dynamic thresholds going by tick size
 - Multi-DEX support (Uniswap V3, Algebra Integral)
 - Unclaimed fee tracking
+- PnL / IL tracking
 - Modular architecture for maintainability
 
 # Installation
@@ -82,10 +83,21 @@ For Laminar
 ```
 0xfdf8b1f915198ed043ee52ec367c3df8ed5c9d79
 ```
-The script will pull the correct factory address from the NFTPositionManager. 
+The script will pull the correct factory address from the NFTPositionManager.
+
+# Example Output
+<img width="1345" height="604" alt="image" src="https://github.com/user-attachments/assets/f819ebbc-5c1c-46d9-a8da-fa231095bca7" />
+
 
 # Notification Example
-<img width="370" height="360" alt="image" src="https://github.com/user-attachments/assets/a971cba4-d817-4223-9641-b3b440d7f5a8" />
+<img width="372" height="373" alt="image" src="https://github.com/user-attachments/assets/764c519c-1781-4fa8-97a7-b5bafb70c443" />
+
+# IL Interpretation
+Positive (+) → LP position plus fees is outperforming HODL by that percentage.
+Negative (−) → underperforming HODL by that percentage.
+
+# APR Interpretation
+APR is being calculated over a 24h rolling window locally. So APRs start high initially and then stabilize after 24h. A timer on how long the position is in the local database is included beneath the APR of each position.
 
 # Troubleshooting
 

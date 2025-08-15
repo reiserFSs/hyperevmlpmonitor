@@ -21,6 +21,8 @@ class PositionDatabase:
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row  # Enable column access by name
         self.create_tables()
+        self._entry_refresh_done = False  # Track if we've done initial refresh
+        self.debug_mode = False  # Default debug mode
         
     def create_tables(self):
         """Create database tables for position tracking"""
@@ -152,6 +154,13 @@ class PositionDatabase:
     def record_position_snapshot(self, position, status, wallet_address, token_prices=None):
         """Record a snapshot of current position state"""
         try:
+            # Ensure an entry exists as early as possible so PnL can compute even if
+            # later snapshot value calculations fail.
+            try:
+                self.check_and_record_entry(position, status, wallet_address, token_prices)
+            except Exception as _:
+                # Non-fatal; continue to snapshot recording
+                pass
             # Calculate USD values if prices available
             position_value_usd = None
             token0_price_usd = None
@@ -168,19 +177,32 @@ class PositionDatabase:
                     token1_price_usd = token_prices[token1_symbol]
                 
                 # Calculate position value
-                if token0_price_usd and token1_price_usd:
-                    position_value_usd = (
-                        status['amount0'] * token0_price_usd +
-                        status['amount1'] * token1_price_usd
-                    )
+                if token0_price_usd is not None and token1_price_usd is not None:
+                    amt0 = status.get('amount0')
+                    amt1 = status.get('amount1')
+                    amt0 = 0 if amt0 is None else amt0
+                    amt1 = 0 if amt1 is None else amt1
+                    position_value_usd = (amt0 * float(token0_price_usd)) + (amt1 * float(token1_price_usd))
                     
                     # Calculate unclaimed fees value
                     if status.get('has_unclaimed_fees'):
-                        unclaimed_fees_usd = (
-                            status.get('fee_amount0', 0) * token0_price_usd +
-                            status.get('fee_amount1', 0) * token1_price_usd
-                        )
+                        # Guard against missing token prices and None fee amounts
+                        unclaimed_fees_usd = 0
+                        fee0 = status.get('fee_amount0')
+                        fee1 = status.get('fee_amount1')
+                        fee0 = 0 if fee0 is None else fee0
+                        fee1 = 0 if fee1 is None else fee1
+                        if token0_price_usd is not None:
+                            unclaimed_fees_usd += float(fee0) * float(token0_price_usd)
+                        if token1_price_usd is not None:
+                            unclaimed_fees_usd += float(fee1) * float(token1_price_usd)
             
+            # Normalize amounts to avoid None passing into NOT NULL columns
+            ins_amount0 = status.get('amount0')
+            ins_amount1 = status.get('amount1')
+            ins_amount0 = 0 if ins_amount0 is None else ins_amount0
+            ins_amount1 = 0 if ins_amount1 is None else ins_amount1
+
             self.conn.execute('''
                 INSERT OR REPLACE INTO position_snapshots (
                     wallet_address, dex_name, token_id, pair_name,
@@ -203,8 +225,8 @@ class PositionDatabase:
                 position['tick_upper'],
                 str(position['liquidity']),
                 status.get('in_range', False),
-                status.get('amount0', 0),
-                status.get('amount1', 0),
+                ins_amount0,
+                ins_amount1,
                 status.get('current_price', 0),
                 token0_price_usd,
                 token1_price_usd,
@@ -216,39 +238,80 @@ class PositionDatabase:
             
             self.conn.commit()
             
-            # Check if this is a new position (entry point)
-            self.check_and_record_entry(position, status, wallet_address, token_prices)
-            
         except Exception as e:
             print(f"Error recording position snapshot: {e}")
     
     def check_and_record_entry(self, position, status, wallet_address, token_prices=None):
         """Check if position is new and record entry point"""
         cursor = self.conn.execute('''
-            SELECT id FROM position_entries 
+            SELECT * FROM position_entries 
             WHERE wallet_address = ? AND dex_name = ? AND token_id = ?
         ''', (wallet_address, position['dex_name'], position['token_id']))
+        existing = cursor.fetchone()
         
-        if not cursor.fetchone():
+        if not existing:
             # This is a new position, record entry point
             entry_value_usd = None
             token0_price_usd = None
             token1_price_usd = None
+            # Preferred order: explicit entry amounts -> theoretical center amounts -> current snapshot amounts
+            entry_amount0 = status.get('entry_amount0')
+            entry_amount1 = status.get('entry_amount1')
+            if entry_amount0 is None or entry_amount1 is None or (entry_amount0 == 0 and entry_amount1 == 0):
+                entry_amount0 = status.get('theoretical_amount0', status.get('amount0'))
+                entry_amount1 = status.get('theoretical_amount1', status.get('amount1'))
+            # Normalize amounts
+            entry_amount0 = 0 if entry_amount0 is None else float(entry_amount0)
+            entry_amount1 = 0 if entry_amount1 is None else float(entry_amount1)
+            # Prefer precise entry USD inferred from chain when present
+            if status.get('entry_value_usd') is not None and status.get('entry_value_usd') > 0:
+                # Direct entry value from blockchain historical data
+                entry_value_usd = float(status.get('entry_value_usd'))
+                token0_price_usd = status.get('entry_token0_price_usd')
+                token1_price_usd = status.get('entry_token1_price_usd')
+            elif status.get('entry_token0_price_usd') is not None and status.get('entry_token1_price_usd') is not None:
+                token0_price_usd = status.get('entry_token0_price_usd')
+                token1_price_usd = status.get('entry_token1_price_usd')
+                entry_value_usd = float(entry_amount0) * float(token0_price_usd) + float(entry_amount1) * float(token1_price_usd)
             
-            if token_prices:
+            if (entry_value_usd is None or entry_value_usd <= 0) and token_prices:
                 token0_symbol = status.get('token0_symbol', '')
                 token1_symbol = status.get('token1_symbol', '')
-                
                 if token0_symbol in token_prices:
                     token0_price_usd = token_prices[token0_symbol]
                 if token1_symbol in token_prices:
                     token1_price_usd = token_prices[token1_symbol]
-                
-                if token0_price_usd and token1_price_usd:
-                    entry_value_usd = (
-                        status['amount0'] * token0_price_usd +
-                        status['amount1'] * token1_price_usd
-                    )
+                if token0_price_usd is not None and token1_price_usd is not None:
+                    entry_value_usd = float(entry_amount0) * float(token0_price_usd) + float(entry_amount1) * float(token1_price_usd)
+
+            # Final fallback: if still missing, use center-of-range price approximation when we have one
+            if (entry_value_usd is None or entry_value_usd <= 0) and status.get('entry_price_center'):
+                center = float(status.get('entry_price_center') or 0)
+                # We value amounts using the center price: token0*center + token1
+                entry_value_usd = float(entry_amount0) * center + float(entry_amount1)
+                token0_price_usd = center
+                token1_price_usd = 1.0
+
+            # If still missing, use current observed amounts and treat any stable side as $1
+            if entry_value_usd is None or entry_value_usd <= 0:
+                try:
+                    t0 = status.get('token0_symbol', '')
+                    t1 = status.get('token1_symbol', '')
+                    # Prefer explicit prices provided in status for stable pairs
+                    if token0_price_usd is None and status.get('entry_token0_price_usd') is not None:
+                        token0_price_usd = status.get('entry_token0_price_usd')
+                    if token1_price_usd is None and status.get('entry_token1_price_usd') is not None:
+                        token1_price_usd = status.get('entry_token1_price_usd')
+                    # As a last resort, if one token is a stablecoin, assume $1
+                    from price_utils import is_stablecoin
+                    if token0_price_usd is None and is_stablecoin(t0):
+                        token0_price_usd = 1.0
+                    if token1_price_usd is None and is_stablecoin(t1):
+                        token1_price_usd = 1.0
+                    if token0_price_usd is not None and token1_price_usd is not None:
+                        entry_value_usd = float(entry_amount0) * float(token0_price_usd) + float(entry_amount1) * float(token1_price_usd)
+                except Exception:
+                    pass
             
             self.conn.execute('''
                 INSERT INTO position_entries (
@@ -260,15 +323,136 @@ class PositionDatabase:
                 wallet_address,
                 position['dex_name'],
                 position['token_id'],
-                status.get('current_price', 0),
-                status.get('amount0', 0),
-                status.get('amount1', 0),
+                float(status.get('entry_price_at_entry', status.get('current_price', 0) or 0.0)),
+                entry_amount0,
+                entry_amount1,
                 entry_value_usd,
                 token0_price_usd,
                 token1_price_usd
             ))
             
             self.conn.commit()
+        else:
+            # Backfill/Update if we have better on-chain entry data
+            # Check if we have precise historical data from blockchain
+            precise_entry_value = status.get('entry_value_usd')
+            if precise_entry_value is not None and precise_entry_value > 0:
+                # We have precise historical data from blockchain
+                old_value = existing['entry_value_usd'] or 0
+                
+                # Always update if old value is missing or significantly different (>10%)
+                should_update = (old_value <= 0 or 
+                               abs(precise_entry_value - old_value) / max(old_value, 1) > 0.1)
+                
+                if should_update:
+                    entry_amount0 = status.get('entry_amount0', existing['entry_amount0'] or 0)
+                    entry_amount1 = status.get('entry_amount1', existing['entry_amount1'] or 0)
+                    token0_price = status.get('entry_token0_price_usd')
+                    token1_price = status.get('entry_token1_price_usd')
+                    entry_price = status.get('entry_price_at_entry', existing['entry_price'] or 0)
+                    
+                    self.conn.execute('''
+                        UPDATE position_entries SET
+                            entry_amount0 = ?,
+                            entry_amount1 = ?,
+                            entry_value_usd = ?,
+                            entry_token0_price_usd = ?,
+                            entry_token1_price_usd = ?,
+                            entry_price = ?
+                        WHERE wallet_address = ? AND dex_name = ? AND token_id = ?
+                    ''', (
+                        entry_amount0,
+                        entry_amount1,
+                        precise_entry_value,
+                        token0_price,
+                        token1_price,
+                        entry_price,
+                        wallet_address,
+                        position['dex_name'],
+                        position['token_id']
+                    ))
+                    self.conn.commit()
+                    
+                    if self.debug_mode:
+                        print(f"Updated entry for {position['dex_name']} #{position['token_id']}: ")
+                        print(f"  Old value: ${old_value:.2f}, New value: ${precise_entry_value:.2f}")
+                    return
+            
+            # Original backfill logic for other cases
+            entry_amount0 = status.get('entry_amount0')
+            entry_amount1 = status.get('entry_amount1')
+            # If not provided in status, prefer existing, otherwise fall back to current snapshot amounts
+            if entry_amount0 is None or entry_amount0 == 0:
+                entry_amount0 = existing['entry_amount0'] if existing['entry_amount0'] is not None and existing['entry_amount0'] != 0 else status.get('theoretical_amount0', status.get('amount0'))
+            if entry_amount1 is None or entry_amount1 == 0:
+                entry_amount1 = existing['entry_amount1'] if existing['entry_amount1'] is not None and existing['entry_amount1'] != 0 else status.get('theoretical_amount1', status.get('amount1'))
+            entry_amount0 = 0 if entry_amount0 is None else float(entry_amount0)
+            entry_amount1 = 0 if entry_amount1 is None else float(entry_amount1)
+            token0_precise = status.get('entry_token0_price_usd')
+            token1_precise = status.get('entry_token1_price_usd')
+            should_try_update = token0_precise is not None and token1_precise is not None
+            if should_try_update:
+                new_value = entry_amount0 * float(token0_precise) + entry_amount1 * float(token1_precise)
+                old_value = existing['entry_value_usd']
+                missing_prices = existing['entry_token0_price_usd'] is None or existing['entry_token1_price_usd'] is None
+                large_diff = False
+                try:
+                    if old_value is None:
+                        large_diff = True
+                    else:
+                        denom = max(abs(float(old_value)), 1e-9)
+                        large_diff = abs(new_value - float(old_value)) / denom > 0.02  # >2% difference
+                except Exception:
+                    large_diff = True
+
+                if missing_prices or large_diff:
+                    self.conn.execute('''
+                        UPDATE position_entries
+                        SET entry_price = ?, entry_amount0 = ?, entry_amount1 = ?,
+                            entry_value_usd = ?, entry_token0_price_usd = ?, entry_token1_price_usd = ?
+                        WHERE wallet_address = ? AND dex_name = ? AND token_id = ?
+                    ''', (
+                        status.get('entry_price_at_entry', status.get('current_price', existing['entry_price'])),
+                        entry_amount0,
+                        entry_amount1,
+                        new_value,
+                        float(token0_precise),
+                        float(token1_precise),
+                        wallet_address,
+                        position['dex_name'],
+                        position['token_id']
+                    ))
+                    self.conn.commit()
+
+            # If entry still looks empty/zero, backfill using current snapshot amounts/prices
+            if (existing['entry_value_usd'] is None or existing['entry_value_usd'] <= 0 or
+                ((existing['entry_amount0'] is None or existing['entry_amount0'] == 0) and (existing['entry_amount1'] is None or existing['entry_amount1'] == 0))):
+                token0_price_usd = None
+                token1_price_usd = None
+                if token_prices:
+                    t0 = status.get('token0_symbol', '')
+                    t1 = status.get('token1_symbol', '')
+                    token0_price_usd = token_prices.get(t0)
+                    token1_price_usd = token_prices.get(t1)
+                if token0_price_usd is not None and token1_price_usd is not None:
+                    fallback_value = float(entry_amount0) * float(token0_price_usd) + float(entry_amount1) * float(token1_price_usd)
+                    self.conn.execute('''
+                        UPDATE position_entries
+                        SET entry_price = ?, entry_amount0 = ?, entry_amount1 = ?,
+                            entry_value_usd = ?, entry_token0_price_usd = ?, entry_token1_price_usd = ?
+                        WHERE wallet_address = ? AND dex_name = ? AND token_id = ?
+                    ''', (
+                        status.get('entry_price_at_entry', status.get('current_price', existing['entry_price'])),
+                        float(entry_amount0),
+                        float(entry_amount1),
+                        fallback_value,
+                        float(token0_price_usd),
+                        float(token1_price_usd),
+                        wallet_address,
+                        position['dex_name'],
+                        position['token_id']
+                    ))
+                    self.conn.commit()
     
     def get_position_entry(self, wallet_address, dex_name, token_id):
         """Get entry point data for a position"""
@@ -279,8 +463,61 @@ class PositionDatabase:
         
         return cursor.fetchone()
     
+    def mark_entries_for_refresh(self, wallet_address=None, positions_with_status=None):
+        """Check for active positions with missing entry values (non-blocking)"""
+        if hasattr(self, '_entry_refresh_done') and self._entry_refresh_done:
+            return
+            
+        try:
+            # Get positions with active liquidity if provided
+            active_token_ids = set()
+            if positions_with_status:
+                for position, status in positions_with_status:
+                    liquidity = float(position.get("liquidity", 0))
+                    if liquidity > 0:
+                        active_token_ids.add(int(position["token_id"]))
+            
+            # Count all entries that need refresh
+            query = "SELECT token_id, COUNT(*) as count FROM position_entries WHERE entry_value_usd IS NULL OR entry_value_usd <= 0"
+            params = []
+            if wallet_address:
+                query += " AND wallet_address = ?"
+                params.append(wallet_address)
+            query += " GROUP BY token_id"
+                
+            cursor = self.conn.execute(query, params)
+            results = cursor.fetchall()
+            
+            active_count = 0
+            inactive_count = 0
+            
+            for row in results:
+                token_id = row['token_id']
+                if positions_with_status and token_id in active_token_ids:
+                    active_count += 1
+                else:
+                    inactive_count += 1
+            
+            if active_count > 0:
+                print(f"📊 {active_count} active positions need entry value refresh (will update automatically)")
+            
+            if inactive_count > 0:
+                print(f"📊 {inactive_count} inactive positions have missing entry data (skipping)")
+            
+            self._entry_refresh_done = True
+        except Exception as e:
+            if hasattr(self, 'debug_mode') and self.debug_mode:
+                print(f"Error checking entries for refresh: {e}")
+    
     def calculate_pnl_metrics(self, position, status, wallet_address, token_prices=None):
         """Calculate PnL and IL metrics for a position"""
+        # Mark entries for refresh on first run (non-blocking)
+        if not hasattr(self, '_entry_refresh_done'):
+            self._entry_refresh_done = False
+        if not self._entry_refresh_done:
+            # We'll call this from display.py with position data
+            pass
+            
         entry = self.get_position_entry(wallet_address, position['dex_name'], position['token_id'])
         
         if not entry or not token_prices:
@@ -289,40 +526,47 @@ class PositionDatabase:
         token0_symbol = status.get('token0_symbol', '')
         token1_symbol = status.get('token1_symbol', '')
         
-        # Get current prices
-        token0_price_usd = token_prices.get(token0_symbol, 0)
-        token1_price_usd = token_prices.get(token1_symbol, 0)
+        # Get current prices (avoid falsy checks; 0.0 is valid for None only when unknown)
+        token0_price_usd = token_prices.get(token0_symbol)
+        token1_price_usd = token_prices.get(token1_symbol)
         
-        if not token0_price_usd or not token1_price_usd:
+        if token0_price_usd is None:
+            token0_price_usd = entry['entry_token0_price_usd'] if 'entry_token0_price_usd' in entry.keys() else None
+        if token1_price_usd is None:
+            token1_price_usd = entry['entry_token1_price_usd'] if 'entry_token1_price_usd' in entry.keys() else None
+        if token0_price_usd is None:
+            token0_price_usd = status.get('entry_token0_price_usd')
+        if token1_price_usd is None:
+            token1_price_usd = status.get('entry_token1_price_usd')
+        
+        if token0_price_usd is None or token1_price_usd is None:
             return None
         
         # Calculate current value
-        current_value = (
-            status['amount0'] * token0_price_usd +
-            status['amount1'] * token1_price_usd
-        )
+        amt0_now = status.get('amount0')
+        amt1_now = status.get('amount1')
+        amt0_now = 0 if amt0_now is None else amt0_now
+        amt1_now = 0 if amt1_now is None else amt1_now
+        current_value = (amt0_now * float(token0_price_usd)) + (amt1_now * float(token1_price_usd))
         
         # Entry value
-        entry_value = entry['entry_value_usd'] or 0
+        entry_value = entry['entry_value_usd'] if entry['entry_value_usd'] is not None else 0
         
         # Calculate what we would have if we just held the tokens (HODL)
-        hodl_value = (
-            entry['entry_amount0'] * token0_price_usd +
-            entry['entry_amount1'] * token1_price_usd
-        )
+        ent_amt0 = entry['entry_amount0'] if entry['entry_amount0'] is not None else 0
+        ent_amt1 = entry['entry_amount1'] if entry['entry_amount1'] is not None else 0
+        hodl_value = (float(ent_amt0) * float(token0_price_usd)) + (float(ent_amt1) * float(token1_price_usd))
         
         # Get total fees earned
         total_fees = self.get_total_fees_collected(wallet_address, position['dex_name'], position['token_id'])
-        total_fees_usd = (
-            total_fees['total_fees0'] * token0_price_usd +
-            total_fees['total_fees1'] * token1_price_usd
-        )
+        total_fees_usd = (float(total_fees['total_fees0']) * float(token0_price_usd)) + (float(total_fees['total_fees1']) * float(token1_price_usd))
         
         # Add current unclaimed fees
-        unclaimed_fees_usd = (
-            status.get('fee_amount0', 0) * token0_price_usd +
-            status.get('fee_amount1', 0) * token1_price_usd
-        )
+        fee0 = status.get('fee_amount0')
+        fee1 = status.get('fee_amount1')
+        fee0 = 0 if fee0 is None else fee0
+        fee1 = 0 if fee1 is None else fee1
+        unclaimed_fees_usd = (float(fee0) * float(token0_price_usd)) + (float(fee1) * float(token1_price_usd))
         
         total_fees_usd += unclaimed_fees_usd
         
@@ -335,8 +579,12 @@ class PositionDatabase:
         il_usd = current_value + total_fees_usd - hodl_value
         il_percent = (il_usd / hodl_value * 100) if hodl_value > 0 else 0
         
-        # Calculate time in position
-        entry_time = datetime.fromisoformat(entry['entry_timestamp'])
+        # Calculate time in position (prefer on-chain acquired timestamp)
+        acquired_ts = status.get('acquired_timestamp')
+        if acquired_ts:
+            entry_time = datetime.fromtimestamp(acquired_ts)
+        else:
+            entry_time = datetime.fromisoformat(entry['entry_timestamp'])
         current_time = datetime.now()
         hours_in_position = (current_time - entry_time).total_seconds() / 3600
         

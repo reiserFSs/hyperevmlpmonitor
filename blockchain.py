@@ -22,6 +22,7 @@ from utils import (
     calculate_theoretical_amounts, apply_symbol_mapping,
     parse_algebra_raw_data
 )
+from price_utils import is_stablecoin
 
 class BlockchainManager:
     """Manages all blockchain interactions"""
@@ -53,7 +54,13 @@ class BlockchainManager:
         self._last_event_block_by_dex = {}
         self._last_event_hints_by_dex = {}
         self._last_scan_status_by_dex = {}
+
+        # Precompute event topic hashes
+        self._topic_transfer = self.w3.keccak(text="Transfer(address,address,uint256)").hex()
+        self._topic_increase = self.w3.keccak(text="IncreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
+        self._topic_decrease = self.w3.keccak(text="DecreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
         self._acquired_ts_cache = {}
+        self._initial_liquidity_cache = {}
 
         # Global RPC rate limiter (tokens/minute)
         self._rpm_limit = 90  # keep headroom under 100 rpm
@@ -76,14 +83,16 @@ class BlockchainManager:
         self._rpc_call_times.append(time.time())
 
     def _rl_call(self, fn, *args, **kwargs):
-        self._throttle_rpc()
-        return fn(*args, **kwargs)
-        self._last_scan_status_by_dex = {}
-
-        # Precompute event topic hashes
-        self._topic_transfer = self.w3.keccak(text="Transfer(address,address,uint256)").hex()
-        self._topic_increase = self.w3.keccak(text="IncreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
-        self._topic_decrease = self.w3.keccak(text="DecreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
+        try:
+            self._throttle_rpc()
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if 'rate limited' in str(e).lower():
+                if self.debug_mode:
+                    print(f"Rate limited, waiting 5 seconds...")
+                time.sleep(5)
+                return fn(*args, **kwargs)
+            raise
 
     def get_enhanced_token_info(self, token_address, dex_name=""):
         """Enhanced token info with better symbol detection and mapping"""
@@ -352,7 +361,7 @@ class BlockchainManager:
                 function_selector = self.w3.keccak(text="globalState()")[:4]
                 raw_result = self.w3.eth.call({
                     'to': pool_address,
-                    'data': function_selector.hex()
+                    'data': '0x' + function_selector.hex()
                 })
                 
                 sqrt_price_x96, current_tick = parse_algebra_raw_data(raw_result, self.debug_mode)
@@ -463,14 +472,12 @@ class BlockchainManager:
         call_index = []  # map index -> (pool, dtype)
         for addr, dtype in normalized:
             selector = slot0_selector if dtype == 'uniswap_v3' else global_selector
-            calls.append((addr, selector.hex()))
+            # Pass bytes selector directly for no-arg calls
+            calls.append((addr, selector))
             call_index.append((addr, dtype))
 
         try:
-            block_num, ret_datas = self._rl_call(self.multicall.functions.aggregate([
-                (addr, bytes.fromhex(data[2:]) if isinstance(data, str) and data.startswith('0x') else data)
-                for addr, data in calls
-            ]).call)
+            block_num, ret_datas = self._rl_call(self.multicall.functions.aggregate(calls).call)
         except Exception:
             return  # silently skip if multicall fails
 
@@ -505,7 +512,6 @@ class BlockchainManager:
         # Batch token0/token1 for all pools
         try:
             pool_min = self.w3.eth.contract(abi=MINIMAL_POOL_ABI, address=Web3.to_checksum_address(list(pool_to_core.keys())[0][0]))
-            calldata_t0 = pool_min.encodeABI(fn_name='token0')[-8:]  # not used; we will encode per pool
         except Exception:
             pool_min = None
 
@@ -927,11 +933,12 @@ class BlockchainManager:
                     self._acquired_ts_cache[cache_key] = ts
                     return ts
             # Fallback: first IncreaseLiquidity for this token (often emitted at mint)
+            # IncreaseLiquidity only has one indexed arg (tokenId). Filter with 2 topics
             inc_logs = self._rl_call(self.w3.eth.get_logs, {
                 'fromBlock': 0,
                 'toBlock': 'latest',
                 'address': Web3.to_checksum_address(position_manager_address),
-                'topics': [self._topic_increase, None, None, id_topic]
+                'topics': [self._topic_increase, id_topic]
             })
             if inc_logs:
                 first = inc_logs[0]
@@ -943,6 +950,263 @@ class BlockchainManager:
         except Exception:
             pass
         return None
+
+    def _get_pool_price_at_block(self, pool_address, dex_type, block_number):
+        """Return pool price (token0 in terms of token1) at a specific block.
+
+        Uses slot0() for Uniswap V3 and globalState() for Algebra. Returns None on failure.
+        Requires an archive-capable RPC. This is best-effort with graceful fallback.
+        """
+        try:
+            if dex_type == "algebra_integral":
+                pool_contract = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(pool_address),
+                    abi=ALGEBRA_POOL_ABI_V3
+                )
+                global_state = pool_contract.functions.globalState().call(block_identifier=int(block_number))
+                sqrt_price_x96 = global_state[0]
+            else:
+                pool_contract = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(pool_address),
+                    abi=POOL_ABI
+                )
+                slot0 = pool_contract.functions.slot0().call(block_identifier=int(block_number))
+                sqrt_price_x96 = slot0[0]
+
+            # Need token decimals to compute human price
+            pool_min = self.w3.eth.contract(address=Web3.to_checksum_address(pool_address), abi=MINIMAL_POOL_ABI)
+            token0_addr = pool_min.functions.token0().call()
+            token1_addr = pool_min.functions.token1().call()
+            t0 = self.get_enhanced_token_info(token0_addr)
+            t1 = self.get_enhanced_token_info(token1_addr)
+            return sqrt_price_to_price(sqrt_price_x96, t0["decimals"], t1["decimals"]) if sqrt_price_x96 else None
+        except Exception:
+            return None
+
+    def get_initial_position_entry(self, position, wallet_address):
+        """Return initial entry data for a position from the mint/first liquidity event.
+
+        First tries to find the NFT mint event (Transfer from 0x0), then falls back to
+        first IncreaseLiquidity. Fetches the actual pool price at that historical block.
+        
+        Returns a dict with keys:
+        { 'block_number', 'timestamp', 'amount0', 'amount1', 'entry_price',
+          'entry_token0_price_usd', 'entry_token1_price_usd', 'entry_value_usd' }
+        """
+        cache_key = (int(position["token_id"]), Web3.to_checksum_address(position["position_manager"]))
+        if cache_key in self._initial_liquidity_cache:
+            return self._initial_liquidity_cache[cache_key]
+
+        try:
+            # Precompute event topic hashes if not yet set
+            if not hasattr(self, '_topic_increase'):
+                self._topic_transfer = self.w3.keccak(text="Transfer(address,address,uint256)").hex()
+                self._topic_increase = self.w3.keccak(text="IncreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
+                self._topic_decrease = self.w3.keccak(text="DecreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
+
+            token_id = int(position["token_id"])
+            id_topic = '0x' + token_id.to_bytes(32, 'big').hex()
+            position_manager = Web3.to_checksum_address(position["position_manager"])
+            
+            # Only fetch historical data for positions with active liquidity
+            # Skip empty positions to speed up startup
+            current_liquidity = float(position.get("liquidity", 0))
+            if current_liquidity == 0:
+                if self.debug_mode:
+                    print(f"Skipping historical lookup for empty position {token_id}")
+                self._initial_liquidity_cache[cache_key] = None
+                return None
+            
+            # Quick exit if not needed - only fetch historical data when entry values are missing/zero
+            skip_historical = False
+            try:
+                import sqlite3
+                conn = sqlite3.connect('lp_positions.db')
+                cursor = conn.execute('''
+                    SELECT entry_value_usd FROM position_entries 
+                    WHERE token_id = ? AND entry_value_usd IS NOT NULL AND entry_value_usd > 0
+                ''', (token_id,))
+                existing = cursor.fetchone()
+                conn.close()
+                if existing:
+                    skip_historical = True
+            except Exception:
+                pass
+                
+            if skip_historical:
+                # Use existing entry data
+                if self.debug_mode:
+                    print(f"Using existing entry data for active position {token_id}")
+                self._initial_liquidity_cache[cache_key] = None
+                return None
+                
+            # Only do expensive blockchain queries if we really need to
+            if self.debug_mode:
+                print(f"Fetching historical entry data for token {token_id} (entry value missing)")
+                
+            # Try to get creation block efficiently - limit search to recent blocks first
+            creation_block = None
+            current_block = self.w3.eth.block_number
+            
+            # Search recent blocks first (last 50k blocks)
+            search_start = max(0, current_block - 50000)
+            
+            try:
+                # Look for mint event in recent blocks
+                logs = self._rl_call(self.w3.eth.get_logs, {
+                    'fromBlock': search_start,
+                    'toBlock': 'latest',
+                    'address': position_manager,
+                    'topics': [
+                        self._topic_transfer,
+                        '0x0000000000000000000000000000000000000000000000000000000000000000',  # from = 0x0
+                        None,
+                        id_topic
+                    ]
+                })
+                if logs:
+                    creation_block = logs[0]['blockNumber']
+                    if self.debug_mode:
+                        print(f"Found mint at block {creation_block}")
+            except Exception:
+                pass
+                
+            # Fallback: look for IncreaseLiquidity in recent blocks
+            if not creation_block:
+                try:
+                    logs = self._rl_call(self.w3.eth.get_logs, {
+                        'fromBlock': search_start,
+                        'toBlock': 'latest',
+                        'address': position_manager,
+                        'topics': [self._topic_increase, id_topic]
+                    })
+                    # First IncreaseLiquidity for this token
+                    if logs:
+                        creation_block = logs[0]['blockNumber']
+                except Exception:
+                    pass
+                    
+            # If still not found, skip historical lookup
+            if not creation_block:
+                if self.debug_mode:
+                    print(f"Could not find creation block for token {token_id}, skipping historical lookup")
+                return None
+            
+            # Get the IncreaseLiquidity event at creation block
+            try:
+                logs = self._rl_call(self.w3.eth.get_logs, {
+                    'fromBlock': creation_block,
+                    'toBlock': creation_block + 10,  # Small range around creation block
+                    'address': position_manager,
+                    'topics': [self._topic_increase, id_topic]
+                })
+                
+                first_increase = logs[0] if logs else None
+                        
+                if not first_increase:
+                    self._initial_liquidity_cache[cache_key] = None
+                    return None
+                    
+            except Exception:
+                self._initial_liquidity_cache[cache_key] = None
+                return None
+
+            # Extract amounts from IncreaseLiquidity event
+            data_bytes = bytes.fromhex(first_increase['data'][2:]) if isinstance(first_increase['data'], str) else first_increase['data']
+            amount0_wei = 0
+            amount1_wei = 0
+            try:
+                if data_bytes and len(data_bytes) >= 96:
+                    # data layout for IncreaseLiquidity (tokenId is indexed):
+                    # [liquidity(32)][amount0(32)][amount1(32)]
+                    # We only need amounts for entry valuation
+                    amount0_wei = int.from_bytes(data_bytes[32:64], 'big')
+                    amount1_wei = int.from_bytes(data_bytes[64:96], 'big')
+            except Exception:
+                amount0_wei = 0
+                amount1_wei = 0
+
+            decimals0 = position["token0_info"]["decimals"]
+            decimals1 = position["token1_info"]["decimals"]
+            amount0 = amount0_wei / (10 ** decimals0)
+            amount1 = amount1_wei / (10 ** decimals1)
+
+            # Get block timestamp
+            try:
+                blk = self._rl_call(self.w3.eth.get_block, creation_block)
+                ts = int(blk['timestamp'])
+            except Exception:
+                ts = None
+
+            # Get pool address
+            pool_address = position.get('pool_address')
+            if not pool_address:
+                try:
+                    pool_address = self.get_pool_address(
+                        position.get('token0_address'), 
+                        position.get('token1_address'), 
+                        position.get('fee'), 
+                        position.get('factory_address'), 
+                        position.get('dex_type', 'uniswap_v3')
+                    )
+                except Exception:
+                    pool_address = None
+
+            # Fetch historical pool price at creation block
+            entry_price = None
+            if pool_address:
+                try:
+                    entry_price = self._get_pool_price_at_block(pool_address, position.get('dex_type', 'uniswap_v3'), creation_block)
+                    if self.debug_mode and entry_price:
+                        print(f"Historical price at block {creation_block}: {entry_price:.6f}")
+                except Exception as e:
+                    if self.debug_mode:
+                        print(f"Could not fetch historical price: {e}")
+
+            # Calculate USD prices
+            token0_symbol = position.get('token0_info', {}).get('display_symbol') or position.get('token0_symbol')
+            token1_symbol = position.get('token1_info', {}).get('display_symbol') or position.get('token1_symbol')
+            entry_token0_price_usd = None
+            entry_token1_price_usd = None
+            
+            # If we couldn't get historical price but amounts exist, try to infer from ratio
+            if not entry_price and amount0 > 0 and amount1 > 0:
+                # Position was likely created in-range, so ratio gives us price
+                entry_price = amount1 / amount0
+                if self.debug_mode:
+                    print(f"Inferred price from amounts ratio: {entry_price:.6f}")
+            
+            if entry_price:
+                if token1_symbol and is_stablecoin(token1_symbol):
+                    entry_token1_price_usd = 1.0
+                    entry_token0_price_usd = entry_price
+                elif token0_symbol and is_stablecoin(token0_symbol):
+                    entry_token0_price_usd = 1.0
+                    entry_token1_price_usd = 1.0 / entry_price if entry_price > 0 else None
+
+            entry_value_usd = None
+            if entry_token0_price_usd is not None and entry_token1_price_usd is not None:
+                entry_value_usd = amount0 * entry_token0_price_usd + amount1 * entry_token1_price_usd
+
+            result = {
+                'block_number': creation_block,
+                'timestamp': ts,
+                'amount0': amount0,
+                'amount1': amount1,
+                'entry_price': entry_price or 0,
+                'entry_token0_price_usd': entry_token0_price_usd,
+                'entry_token1_price_usd': entry_token1_price_usd,
+                'entry_value_usd': entry_value_usd
+            }
+            self._initial_liquidity_cache[cache_key] = result
+            return result
+        except Exception as e:
+            if self.debug_mode:
+                import traceback
+                print(f"Error in get_initial_position_entry: {e}")
+                traceback.print_exc()
+            self._initial_liquidity_cache[cache_key] = None
+            return None
 
     def check_position_status(self, position, wallet_address):
         """Check position status with fee tracking"""
@@ -983,9 +1247,19 @@ class BlockchainManager:
         
         # Get unclaimed fees
         fee_data = self.get_unclaimed_fees(position, wallet_address)
-        # Get acquisition timestamp
+        # Get acquisition timestamp and initial entry data
         acquired_ts = self.get_position_acquired_timestamp(position['token_id'], position['position_manager'], wallet_address)
+        initial_entry = self.get_initial_position_entry(position, wallet_address)
         
+        # Deterministic fallback entry price from range boundaries: use geometric mean of lower/upper prices (center of range)
+        # This serves as a reasonable approximation when on-chain mint data isn't available.
+        center_price = 0
+        try:
+            if lower_price > 0 and upper_price > 0:
+                center_price = (lower_price * upper_price) ** 0.5
+        except Exception:
+            center_price = 0
+
         return {
             "in_range": in_range,
             "current_tick": current_tick,
@@ -1013,5 +1287,14 @@ class BlockchainManager:
             "fee_amount1_wei": fee_data["fee_amount1_wei"],
             "has_unclaimed_fees": fee_data["has_fees"],
             "fee_error": fee_data.get("error"),
-            "acquired_timestamp": acquired_ts
+            "acquired_timestamp": acquired_ts,
+            # Initial (entry) data for accurate PnL
+            "entry_amount0": (initial_entry or {}).get('amount0'),
+            "entry_amount1": (initial_entry or {}).get('amount1'),
+            "entry_price_at_entry": (initial_entry or {}).get('entry_price', 0),
+            "entry_token0_price_usd": (initial_entry or {}).get('entry_token0_price_usd'),
+            "entry_token1_price_usd": (initial_entry or {}).get('entry_token1_price_usd'),
+            "entry_value_usd": (initial_entry or {}).get('entry_value_usd'),
+            # Provide center price approximation to DB layer for fallback valuation
+            "entry_price_center": center_price
         }
