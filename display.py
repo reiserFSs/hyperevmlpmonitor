@@ -81,6 +81,10 @@ class RichDisplayManager:
     
     def create_position_table_with_pnl(self, positions_with_status, wallet_address):
         """Create enhanced position table with PnL/IL metrics"""
+        # Check for entry refresh needs (active positions only)
+        if hasattr(self, 'db') and self.db:
+            self.db.mark_entries_for_refresh(wallet_address, positions_with_status)
+        
         # Extract token prices
         token_prices = {}
         show_value_column = False
@@ -126,12 +130,11 @@ class RichDisplayManager:
             pnl_metrics = None
             if self.db and token_prices:
                 try:
-                    pnl_metrics = self.db.calculate_pnl_metrics(
+                    # Record snapshot/entry first so PnL has data immediately
+                    self.db.record_position_snapshot(
                         position, status, wallet_address, token_prices
                     )
-                    
-                    # Record snapshot for historical tracking
-                    self.db.record_position_snapshot(
+                    pnl_metrics = self.db.calculate_pnl_metrics(
                         position, status, wallet_address, token_prices
                     )
                 except Exception as e:
