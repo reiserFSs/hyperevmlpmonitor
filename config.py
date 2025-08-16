@@ -265,14 +265,20 @@ def setup_optional_settings(config):
     
     # Screen clearing
     if config["display_settings"].get("use_rich_ui", True):
-        # Rich UI benefits from screen clearing
-        clear_screen_input = input(f"\nEnable screen clearing for cleaner display? (y/n, default: y): ").strip().lower()
-        if clear_screen_input in ['n', 'no']:
-            config["display_settings"]["clear_screen"] = False
-            print("📺 Screen clearing disabled - output will scroll")
-        else:
+        # Rich UI: Choose between live display and screen clearing
+        print("\n📺 Display Update Method:")
+        print("1. Persistent Live Display (smooth, no flicker)")
+        print("2. Screen Clearing (traditional, clear screen each update)")
+        display_choice = input("Choose display method (1-2, default: 1): ").strip()
+        
+        if display_choice == "2":
+            config["display_settings"]["use_live_display"] = False
             config["display_settings"]["clear_screen"] = True
-            print("📺 Screen clearing enabled - cleaner display")
+            print("📺 Screen clearing mode enabled - traditional display")
+        else:
+            config["display_settings"]["use_live_display"] = True
+            config["display_settings"]["clear_screen"] = False
+            print("🔴 Live display mode enabled - smooth persistent updates")
     else:
         # For simple text, scrolling might be preferred
         clear_screen_input = input(f"\nEnable screen clearing? (y/n, default: n): ").strip().lower()

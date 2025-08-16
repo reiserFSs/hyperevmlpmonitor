@@ -200,8 +200,13 @@ def show_features_status(config):
     
     # Rich UI status
     use_rich = config.get("display_settings", {}).get("use_rich_ui", True)
+    use_live = config.get("display_settings", {}).get("use_live_display", False)
+    
     if RICH_AVAILABLE and use_rich:
-        features.append(("🎨 Display", "Rich UI", "green"))
+        if use_live:
+            features.append(("🎨 Display", "Rich UI (Live Mode)", "green"))
+        else:
+            features.append(("🎨 Display", "Rich UI (Clear Mode)", "green"))
     elif RICH_AVAILABLE and not use_rich:
         features.append(("🎨 Display", "Simple Text (Rich available)", "yellow"))
     else:

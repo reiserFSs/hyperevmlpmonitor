@@ -50,6 +50,7 @@ DEFAULT_CONFIG = {
         "show_sparklines": True,          # Show mini charts in Rich UI (future feature)
         
         # Existing display settings
+        "use_live_display": False,        # Use Rich Live for persistent display (vs screen clearing)
         "clear_screen": True,
         "color_scheme": "rich",           # "rich", "minimal", or "none"
         "debug_mode": False,

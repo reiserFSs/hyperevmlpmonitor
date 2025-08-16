@@ -210,6 +210,140 @@ class EnhancedLPMonitor:
         cycles_since_full_rescan = 0
         notification_sent_timer = 0  # Track how long to show notification message
         
+        # Check if we should use persistent live display instead of screen clearing
+        use_live_display = (self.use_rich and 
+                           self.config.get("display_settings", {}).get("use_live_display", False))
+        
+        if use_live_display:
+            self._monitor_with_live_display(cycles_since_refresh, refresh_interval, 
+                                          full_rescan_interval_cycles, cycles_since_full_rescan, 
+                                          notification_sent_timer)
+        else:
+            self._monitor_with_screen_clearing(cycles_since_refresh, refresh_interval, 
+                                             full_rescan_interval_cycles, cycles_since_full_rescan, 
+                                             notification_sent_timer)
+    
+    def _monitor_with_live_display(self, cycles_since_refresh, refresh_interval, 
+                                  full_rescan_interval_cycles, cycles_since_full_rescan, 
+                                  notification_sent_timer):
+        """Monitor with Rich Live persistent display"""
+        console.print("[cyan]🔴 Live Display Mode - Press Ctrl+C to stop[/cyan]")
+        time.sleep(1)  # Brief pause to let user see the message
+        
+        # Initial layout creation
+        positions_with_status = self.check_all_positions_batch()
+        layout = self.display.rich_display.create_dashboard_layout_with_pnl(
+            positions_with_status, 
+            self.wallet_address,
+            refresh_countdown=None,
+            notification_sent=False,
+            refresh_cycle=(cycles_since_refresh, refresh_interval),
+            next_full_rescan_s=max(0, (full_rescan_interval_cycles - cycles_since_full_rescan) * self.config["check_interval"])
+        )
+        
+        with Live(layout, console=console, refresh_per_second=2, screen=True, auto_refresh=False) as live:
+            while True:
+                try:
+                    # Check all positions
+                    positions_with_status = self.check_all_positions_batch()
+                    
+                    # Calculate refresh countdown
+                    cycles_until_refresh = refresh_interval - cycles_since_refresh
+                    refresh_countdown = cycles_until_refresh if cycles_until_refresh <= 5 else None
+                    
+                    # Check if notification was sent this cycle
+                    notification_sent_this_cycle = False
+                    
+                    # Send notifications if enabled
+                    if self.notifications.enabled and positions_with_status:
+                        # Check if notification was actually sent (respects cooldowns)
+                        if self.notifications.should_send_notification():
+                            self.notifications.send_status_notification(
+                                positions_with_status, 
+                                self.config["wallet_address"], 
+                                self.debug_mode
+                            )
+                            notification_sent_timer = 3  # Show for 3 cycles
+                            notification_sent_this_cycle = True
+                    
+                    # Track notification display timer
+                    if notification_sent_timer > 0 and not notification_sent_this_cycle:
+                        notification_sent_timer -= 1
+                    
+                    # Update layout for live display
+                    updated_layout = self.display.rich_display.create_dashboard_layout_with_pnl(
+                        positions_with_status, 
+                        self.wallet_address,
+                        refresh_countdown=refresh_countdown,
+                        notification_sent=(notification_sent_timer > 0),
+                        refresh_cycle=(cycles_since_refresh, refresh_interval),
+                        next_full_rescan_s=max(0, (full_rescan_interval_cycles - cycles_since_full_rescan) * self.config["check_interval"])
+                    )
+                    
+                    # Update the live display
+                    live.update(updated_layout)
+                    live.refresh()
+                    
+                    # Handle position refresh
+                    should_refresh = cycles_since_refresh >= refresh_interval
+                    if should_refresh:
+                        is_refreshing = True
+                        # Show refreshing state
+                        refreshing_layout = self.display.rich_display.create_dashboard_layout_with_pnl(
+                            positions_with_status,
+                            self.wallet_address,
+                            refresh_countdown=refresh_countdown,
+                            notification_sent=(notification_sent_timer > 0),
+                            refresh_cycle=(cycles_since_refresh, refresh_interval),
+                            is_refreshing=True,
+                            next_full_rescan_s=max(0, (full_rescan_interval_cycles - cycles_since_full_rescan) * self.config["check_interval"])
+                        )
+                        live.update(refreshing_layout)
+                        live.refresh()
+                        
+                        # Perform silent refresh
+                        force_full = cycles_since_full_rescan >= full_rescan_interval_cycles
+                        changes_detected, had_errors = self.refresh_positions(silent=not force_full, force_full=force_full)
+                        if had_errors:
+                            time.sleep(2)
+                        
+                        cycles_since_refresh = 0
+                        cycles_since_full_rescan = 0 if force_full else cycles_since_full_rescan
+                        is_refreshing = False
+                    
+                    # Handle zero liquidity detection (immediate refresh)
+                    zero_liquidity_detected = False
+                    for position, status in positions_with_status:
+                        if status:
+                            live_liquidity = self.blockchain.get_live_liquidity(position)
+                            if live_liquidity == 0:
+                                zero_liquidity_detected = True
+                                break
+                    
+                    if zero_liquidity_detected:
+                        self.refresh_positions(silent=True)
+                        cycles_since_refresh = 0
+                        time.sleep(2)
+                        continue
+                    
+                    # Wait before next check
+                    time.sleep(self.config["check_interval"])
+                    cycles_since_refresh += 1
+                    cycles_since_full_rescan += 1
+                    
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    if self.debug_mode:
+                        import traceback
+                        traceback.print_exc()
+                    console.print(f"[red]Error in monitoring loop: {e}[/red]")
+                    time.sleep(5)
+    
+    def _monitor_with_screen_clearing(self, cycles_since_refresh, refresh_interval, 
+                                    full_rescan_interval_cycles, cycles_since_full_rescan, 
+                                    notification_sent_timer):
+        """Monitor with traditional screen clearing"""
         while True:
             try:
                 # Check all positions
