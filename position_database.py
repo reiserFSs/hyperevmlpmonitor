@@ -79,6 +79,7 @@ class PositionDatabase:
                 
                 -- Entry data
                 entry_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                acquired_timestamp REAL,  -- Unix timestamp when position was first acquired
                 entry_price REAL NOT NULL,
                 entry_amount0 REAL NOT NULL,
                 entry_amount1 REAL NOT NULL,
@@ -148,6 +149,24 @@ class PositionDatabase:
                 percent_time_in_range REAL
             )
         ''')
+        
+        # Add acquired_timestamp column if it doesn't exist (migration)
+        try:
+            self.conn.execute('ALTER TABLE position_entries ADD COLUMN acquired_timestamp REAL')
+        except Exception:
+            # Column already exists
+            pass
+        
+        # Populate acquired_timestamp for existing entries that don't have it
+        # This converts the entry_timestamp (datetime string) to Unix timestamp
+        try:
+            self.conn.execute('''
+                UPDATE position_entries 
+                SET acquired_timestamp = strftime('%s', entry_timestamp)
+                WHERE acquired_timestamp IS NULL
+            ''')
+        except Exception:
+            pass
         
         self.conn.commit()
     
@@ -313,12 +332,16 @@ class PositionDatabase:
                 except Exception:
                     pass
             
+            # Store the acquired timestamp from blockchain data if available
+            acquired_ts = status.get('acquired_timestamp')
+            
             self.conn.execute('''
                 INSERT INTO position_entries (
                     wallet_address, dex_name, token_id,
                     entry_price, entry_amount0, entry_amount1,
-                    entry_value_usd, entry_token0_price_usd, entry_token1_price_usd
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    entry_value_usd, entry_token0_price_usd, entry_token1_price_usd,
+                    acquired_timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 wallet_address,
                 position['dex_name'],
@@ -328,7 +351,8 @@ class PositionDatabase:
                 entry_amount1,
                 entry_value_usd,
                 token0_price_usd,
-                token1_price_usd
+                token1_price_usd,
+                acquired_ts
             ))
             
             self.conn.commit()
@@ -579,11 +603,15 @@ class PositionDatabase:
         il_usd = current_value + total_fees_usd - hodl_value
         il_percent = (il_usd / hodl_value * 100) if hodl_value > 0 else 0
         
-        # Calculate time in position (prefer on-chain acquired timestamp)
+        # Calculate time in position (prefer on-chain acquired timestamp, fallback to database entry timestamp)
         acquired_ts = status.get('acquired_timestamp')
-        if acquired_ts:
+        if acquired_ts and acquired_ts > 0:
             entry_time = datetime.fromtimestamp(acquired_ts)
+        elif entry['acquired_timestamp'] and entry['acquired_timestamp'] > 0:
+            # Use stored acquired timestamp from database as fallback
+            entry_time = datetime.fromtimestamp(entry['acquired_timestamp'])
         else:
+            # Final fallback: use database entry timestamp
             entry_time = datetime.fromisoformat(entry['entry_timestamp'])
         current_time = datetime.now()
         hours_in_position = (current_time - entry_time).total_seconds() / 3600

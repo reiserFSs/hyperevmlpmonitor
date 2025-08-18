@@ -392,7 +392,10 @@ class RichDisplayManager:
                     total_pnl += pnl_metrics['pnl_usd']
                     total_il += pnl_metrics['il_usd']
                     total_fees += pnl_metrics['total_fees_earned_usd']
-            except:
+            except Exception as e:
+                # Debug: print the actual error instead of silently continuing
+                if hasattr(self, 'debug_mode') and self.debug_mode:
+                    print(f"Error calculating PnL for position {position.get('token_id', 'unknown')}: {e}")
                 continue
         
         if positions_with_data == 0:

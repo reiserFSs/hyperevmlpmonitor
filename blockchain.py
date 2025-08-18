@@ -901,8 +901,8 @@ class BlockchainManager:
             return position["liquidity"]  # Fallback to cached value
 
     def get_position_acquired_timestamp(self, token_id, position_manager_address, wallet_address):
-        """Return UNIX timestamp when the current wallet acquired this tokenId.
-        Uses Transfer(to=wallet, tokenId) last occurrence; cached to avoid repeated calls.
+        """Return UNIX timestamp when the current wallet initially acquired this tokenId.
+        Uses Transfer(to=wallet, tokenId) first occurrence to prevent fee collection from resetting APR.
         """
         cache_key = (int(token_id), Web3.to_checksum_address(position_manager_address), Web3.to_checksum_address(wallet_address))
         if cache_key in self._acquired_ts_cache:
@@ -918,8 +918,11 @@ class BlockchainManager:
                 'topics': [self._topic_transfer, None, None, id_topic]
             })
             wallet_norm = Web3.to_checksum_address(wallet_address)
-            # Walk from newest to oldest to find last time it was transferred to the wallet
-            for lg in reversed(list(logs) if logs else []):
+            
+            # Find the FIRST time it was transferred to the wallet (not the most recent)
+            # This prevents fee collection or other operations from resetting the APR calculation
+            first_acquisition_ts = None
+            for lg in logs if logs else []:
                 if not lg.get('topics') or len(lg['topics']) < 4:
                     continue
                 try:
@@ -930,8 +933,12 @@ class BlockchainManager:
                     block_num = lg['blockNumber']
                     block = self._rl_call(self.w3.eth.get_block, int(block_num))
                     ts = int(block['timestamp'])
-                    self._acquired_ts_cache[cache_key] = ts
-                    return ts
+                    if first_acquisition_ts is None or ts < first_acquisition_ts:
+                        first_acquisition_ts = ts
+            
+            if first_acquisition_ts:
+                self._acquired_ts_cache[cache_key] = first_acquisition_ts
+                return first_acquisition_ts
             # Fallback: first IncreaseLiquidity for this token (often emitted at mint)
             # IncreaseLiquidity only has one indexed arg (tokenId). Filter with 2 topics
             inc_logs = self._rl_call(self.w3.eth.get_logs, {
