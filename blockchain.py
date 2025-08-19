@@ -1024,7 +1024,7 @@ class BlockchainManager:
             
             # --- Find Creation Block ---
             creation_block = None
-            current_block = self._rl_call(self.w3.eth.block_number)
+            current_block = self._rl_call(lambda: self.w3.eth.block_number)
             if self.debug_mode:
                 print(f"DEBUG {token_id_for_debug}: Current block is {current_block}. Searching last ~12 hours for mint event...")
 

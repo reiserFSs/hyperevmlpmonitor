@@ -105,8 +105,114 @@ def get_position_creation_block(blockchain, position_manager, token_id, debug=Fa
     return None
 
 
+def get_entry_price_from_first_snapshot(conn, wallet, dex, token_id, debug=False):
+    """Get entry price from the first RELIABLE snapshot data (with validation)"""
+    try:
+        if debug:
+            print(f"  Attempting to get entry price from early snapshots...")
+        
+        # Get the first few snapshots to find a reliable one
+        cursor = conn.execute("""
+            SELECT amount0, amount1, current_price, timestamp, in_range
+            FROM position_snapshots 
+            WHERE wallet_address = ? AND dex_name = ? AND token_id = ?
+            ORDER BY timestamp ASC 
+            LIMIT 10
+        """, (wallet, dex, token_id))
+        
+        snapshots = cursor.fetchall()
+        
+        for snapshot in snapshots:
+            if snapshot['amount0'] > 0 and snapshot['amount1'] > 0:
+                amount0 = snapshot['amount0']
+                amount1 = snapshot['amount1']
+                current_price = snapshot['current_price']
+                snapshot_time = snapshot['timestamp']
+                in_range = snapshot['in_range']
+                
+                # Calculate ratio and check if it's reasonable
+                amount_ratio = amount1 / amount0
+                
+                # Validate: amount ratio should be close to pool price (within 50% tolerance)
+                # This catches corrupted data where amounts don't match market conditions
+                if current_price and current_price > 0:
+                    price_diff_pct = abs(amount_ratio - current_price) / current_price
+                    
+                    if debug:
+                        print(f"  Checking snapshot from {snapshot_time}")
+                        print(f"    Amount ratio: {amount_ratio:.6f}")
+                        print(f"    Pool price: {current_price:.6f}")
+                        print(f"    Difference: {price_diff_pct:.1%}")
+                        print(f"    In range: {in_range}")
+                    
+                    # Accept if ratio is reasonably close to pool price (< 15% difference)
+                    if price_diff_pct < 0.15:  # 15% tolerance - stricter validation
+                        if debug:
+                            print(f"  ✅ Found reliable snapshot from {snapshot_time}")
+                            print(f"  ✅ Validated amounts: {amount0:.6f} token0, {amount1:.6f} token1")
+                            print(f"  ✅ Entry price from snapshot: {amount_ratio:.6f}")
+                        
+                        return amount_ratio, amount0, amount1, snapshot_time
+                    else:
+                        if debug:
+                            print(f"  ❌ Snapshot rejected - ratio too far from pool price")
+                else:
+                    # If no pool price to validate against, use first available
+                    if debug:
+                        print(f"  ⚠️  No pool price to validate, using first snapshot")
+                        print(f"  ✅ Entry price from snapshot: {amount_ratio:.6f}")
+                    
+                    return amount_ratio, amount0, amount1, snapshot_time
+            
+    except Exception as e:
+        if debug:
+            print(f"  ⚠️  Could not get snapshot data: {e}")
+    
+    return None, None, None, None
+
+
+def calculate_entry_price_from_actual_amounts(blockchain, position_manager, token_id, token0_info, token1_info, debug=False):
+    """Calculate entry price from actual IncreaseLiquidity event data (MOST ACCURATE)"""
+    try:
+        if debug:
+            print(f"  Attempting to get actual entry amounts from IncreaseLiquidity event...")
+        
+        # Get the actual entry data from blockchain
+        # This uses the main system's proven approach
+        position_data = {
+            'token_id': token_id,
+            'position_manager': position_manager,
+            'token0_info': token0_info,
+            'token1_info': token1_info,
+            'token0_symbol': token0_info.get('display_symbol', ''),
+            'token1_symbol': token1_info.get('display_symbol', ''),
+        }
+        
+        entry_data = blockchain.get_initial_position_entry(position_data, "")
+        
+        if entry_data and entry_data.get('amount0') and entry_data.get('amount1'):
+            amount0 = entry_data['amount0']
+            amount1 = entry_data['amount1']
+            
+            # Calculate the actual entry price from the ratio of deposited amounts
+            # This is the REAL price when the position was created
+            actual_entry_price = amount1 / amount0  # token0 price in terms of token1
+            
+            if debug:
+                print(f"  ✅ Found actual entry amounts: {amount0:.6f} token0, {amount1:.6f} token1")
+                print(f"  ✅ Actual entry price from amounts: {actual_entry_price:.6f}")
+            
+            return actual_entry_price, amount0, amount1, entry_data
+            
+    except Exception as e:
+        if debug:
+            print(f"  ⚠️  Could not get actual entry data: {e}")
+    
+    return None, None, None, None
+
+
 def calculate_entry_price_from_position_range(tick_lower, tick_upper, token0_decimals, token1_decimals, debug=False):
-    """Calculate entry price from position's tick range using the geometric mean of the range bounds"""
+    """Calculate entry price from position's tick range using the geometric mean (FALLBACK METHOD)"""
     try:
         # Calculate prices at lower and upper bounds using 1.0001^tick formula
         lower_price = tick_to_price(tick_lower, token0_decimals, token1_decimals)
@@ -120,7 +226,7 @@ def calculate_entry_price_from_position_range(tick_lower, tick_upper, token0_dec
             print(f"  Tick range: {tick_lower} to {tick_upper}")
             print(f"  Lower price: {lower_price:.6f}")
             print(f"  Upper price: {upper_price:.6f}")
-            print(f"  Entry price (geometric mean): {entry_price:.6f}")
+            print(f"  Entry price (geometric mean fallback): {entry_price:.6f}")
         
         return entry_price, lower_price, upper_price
         
@@ -249,16 +355,58 @@ def fix_position_entry(conn, blockchain, wallet, dex, token_id, position_manager
         token0_info = blockchain.get_enhanced_token_info(token0)
         token1_info = blockchain.get_enhanced_token_info(token1)
         
-        # Calculate entry price using the position's tick range (CORRECT METHOD)
-        entry_price, lower_price, upper_price = calculate_entry_price_from_position_range(
-            tick_lower, tick_upper, token0_info["decimals"], token1_info["decimals"], debug
+        # METHOD 1: Try to get entry price from first snapshot (MOST ACCURATE)
+        snapshot_entry_price, snapshot_amount0, snapshot_amount1, snapshot_time = get_entry_price_from_first_snapshot(
+            conn, wallet, dex, token_id, debug
         )
         
+        entry_price = None
+        final_entry_amount0 = entry_amount0
+        final_entry_amount1 = entry_amount1
+        calculation_method = "unknown"
+        
+        if snapshot_entry_price and snapshot_amount0 and snapshot_amount1:
+            # Use the MOST ACCURATE method: first snapshot data
+            entry_price = snapshot_entry_price
+            final_entry_amount0 = snapshot_amount0
+            final_entry_amount1 = snapshot_amount1
+            calculation_method = "first_snapshot_data"
+            if debug:
+                print(f"  ✅ Using first snapshot data from {snapshot_time}")
+        else:
+            # METHOD 2: Try to get actual entry price from IncreaseLiquidity event
+            actual_entry_price, actual_amount0, actual_amount1, entry_data = calculate_entry_price_from_actual_amounts(
+                blockchain, position_manager, token_id, token0_info, token1_info, debug
+            )
+            
+            if actual_entry_price and actual_amount0 and actual_amount1:
+                # Use blockchain event data
+                entry_price = actual_entry_price
+                final_entry_amount0 = actual_amount0
+                final_entry_amount1 = actual_amount1
+                calculation_method = "blockchain_event_data"
+                if debug:
+                    print(f"  ✅ Using actual entry data from blockchain")
+            elif entry_amount0 > 0 and entry_amount1 > 0:
+                # METHOD 3: Calculate from existing entry amounts in database
+                entry_price = entry_amount1 / entry_amount0  # token0 price in terms of token1
+                calculation_method = "database_amounts_ratio"
+                if debug:
+                    print(f"  ✅ Calculated entry price from database amounts: {entry_price:.6f}")
+            else:
+                # METHOD 4: Fallback to geometric mean of tick range
+                if debug:
+                    print(f"  ⚠️  Falling back to geometric mean calculation")
+                entry_price, lower_price, upper_price = calculate_entry_price_from_position_range(
+                    tick_lower, tick_upper, token0_info["decimals"], token1_info["decimals"], debug
+                )
+                calculation_method = "geometric_mean_fallback"
+        
         if not entry_price:
-            print("  Could not calculate entry price from tick range")
+            print("  Could not calculate entry price with any method")
             return
             
-        print(f"  Entry price from position range: {entry_price:.6f}")
+        print(f"  Entry price ({calculation_method}): {entry_price:.6f}")
         
         # Calculate USD values based on entry price
         token0_usd = None
@@ -274,19 +422,22 @@ def fix_position_entry(conn, blockchain, wallet, dex, token_id, position_manager
             print("  No stablecoin detected, cannot determine USD prices")
             return
             
-        if token0_usd and token1_usd and entry_amount0 > 0 and entry_amount1 > 0:
-            new_value = entry_amount0 * token0_usd + entry_amount1 * token1_usd
+        if token0_usd and token1_usd and final_entry_amount0 > 0 and final_entry_amount1 > 0:
+            new_value = final_entry_amount0 * token0_usd + final_entry_amount1 * token1_usd
             print(f"  New entry value: ${new_value:.2f} (token0=${token0_usd:.4f}, token1=${token1_usd:.4f})")
+            print(f"  Using amounts: {final_entry_amount0:.6f} token0, {final_entry_amount1:.6f} token1")
             
             if abs(new_value - current_entry_value) > 0.01:
                 if not dry_run:
+                    # Update with the corrected amounts as well
                     conn.execute("""
                         UPDATE position_entries
-                        SET entry_value_usd = ?, entry_token0_price_usd = ?, entry_token1_price_usd = ?, entry_price = ?
+                        SET entry_value_usd = ?, entry_token0_price_usd = ?, entry_token1_price_usd = ?, 
+                            entry_price = ?, entry_amount0 = ?, entry_amount1 = ?
                         WHERE wallet_address = ? AND dex_name = ? AND token_id = ?
-                    """, (new_value, token0_usd, token1_usd, entry_price, wallet, dex, token_id))
+                    """, (new_value, token0_usd, token1_usd, entry_price, final_entry_amount0, final_entry_amount1, wallet, dex, token_id))
                     conn.commit()
-                    print("  ✅ Updated entry value")
+                    print("  ✅ Updated entry value and amounts")
             else:
                 print("  Entry value already correct")
         else:
