@@ -228,28 +228,12 @@ class RichDisplayManager:
                     
                     total_fees_earned += pnl_metrics['total_fees_earned_usd']
                 else:
-                    # Check if this is a new position needing entry data
-                    entry = None
-                    if self.db:
-                        try:
-                            entry = self.db.get_position_entry(wallet_address, position['dex_name'], position['token_id'])
-                        except:
-                            pass
-                    
-                    if entry and (entry['entry_value_usd'] is None or entry['entry_value_usd'] <= 0):
-                        # New position waiting for historical data
-                        row.extend([
-                            Text("⏳ NEW", style="yellow"),
-                            Text("⏳ NEW", style="yellow"),
-                            Text("-", style="dim")
-                        ])
-                    else:
-                        # No PnL data yet
-                        row.extend([
-                            Text("New", style="dim"),
-                            Text("New", style="dim"),
-                            Text("-", style="dim")
-                        ])
+                    # No PnL data yet
+                    row.extend([
+                        Text("New", style="dim"),
+                        Text("New", style="dim"),
+                        Text("-", style="dim")
+                    ])
             
             # Risk level
             risk_text = self.get_compact_risk_badge(position, status)
@@ -408,10 +392,7 @@ class RichDisplayManager:
                     total_pnl += pnl_metrics['pnl_usd']
                     total_il += pnl_metrics['il_usd']
                     total_fees += pnl_metrics['total_fees_earned_usd']
-            except Exception as e:
-                # Debug: print the actual error instead of silently continuing
-                if hasattr(self, 'debug_mode') and self.debug_mode:
-                    print(f"Error calculating PnL for position {position.get('token_id', 'unknown')}: {e}")
+            except:
                 continue
         
         if positions_with_data == 0:

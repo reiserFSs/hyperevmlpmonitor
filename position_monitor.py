@@ -21,9 +21,12 @@ from constants import VERSION, DEVELOPER
 from utils import calculate_dynamic_thresholds, get_risk_level
 import sqlite3
 
-# REMOVED: The old entry-fix logic is deprecated.
-# The system now relies on the robust historical data fetching
-# in blockchain.py (get_initial_position_entry).
+# Reuse the existing entry-fix logic
+try:
+    import fix_entry_prices as entry_fix
+    ENTRY_FIX_AVAILABLE = True
+except Exception:
+    ENTRY_FIX_AVAILABLE = False
 
 # Database utilities for seeding entries if missing
 try:
@@ -106,8 +109,12 @@ class EnhancedLPMonitor:
             print(f"Found {len(self.positions)} LP positions total")
             print("=" * 70)
 
-        # REMOVED: The call to the deprecated auto-fixer.
-        # The new logic in blockchain.py handles this automatically and correctly.
+        # Auto-fix historical entry values for active positions at startup
+        try:
+            self._auto_fix_active_entries_on_startup()
+        except Exception as _:
+            # Non-fatal; continue monitoring
+            pass
 
     def print_initial_info(self):
         """Print initial configuration information with Rich formatting"""
@@ -644,8 +651,121 @@ class EnhancedLPMonitor:
 
         return (new_count != old_count), had_errors_any
 
-    # REMOVED: The entire _auto_fix_active_entries_on_startup function is deprecated.
-    # All historical entry logic is now correctly handled by the BlockchainManager.
+    def _auto_fix_active_entries_on_startup(self):
+        """Automatically fix entry values for active positions at startup.
+        Uses the existing fix_entry_prices logic, scoped to positions with live liquidity.
+        """
+        if not ENTRY_FIX_AVAILABLE:
+            return
+        if not self.config.get("pnl_settings", {}).get("enabled", True):
+            return
+
+        # Determine DB path
+        db_path = self.config.get("pnl_settings", {}).get("database_path", "lp_positions.db")
+
+        # Build map from dex name to position manager
+        dex_to_pm = {d.get("name"): d.get("position_manager") for d in self.config.get("dexes", [])}
+
+        # Collect active positions (liquidity > 0)
+        active_keys = []  # list of (wallet, dex_name, token_id)
+        for pos in self.positions:
+            try:
+                live_liquidity = self.blockchain.get_live_liquidity(pos)
+                if live_liquidity and float(live_liquidity) > 0:
+                    dex_name = pos.get("dex_name")
+                    token_id = pos.get("token_id")
+                    if dex_name is None or token_id is None:
+                        continue
+                    active_keys.append((self.wallet_address, dex_name, int(token_id)))
+            except Exception:
+                continue
+
+        if not active_keys:
+            return
+
+        # De-duplicate
+        seen = set()
+        unique_active = []
+        for item in active_keys:
+            if item not in seen:
+                seen.add(item)
+                unique_active.append(item)
+
+        # Optionally seed entries for active positions so the fixer has data
+        if POSITION_DB_AVAILABLE:
+            try:
+                pdb = PositionDatabase(db_path)
+                # Minimize on-chain calls by checking status only for active positions
+                for pos in self.positions:
+                    key = (self.wallet_address, pos.get("dex_name"), int(pos.get("token_id")) if pos.get("token_id") is not None else None)
+                    if key not in seen:
+                        continue
+                    # Fetch status to derive initial entry amounts if needed
+                    try:
+                        status = self.blockchain.check_position_status(pos, self.wallet_address)
+                        if status:
+                            # Record snapshot first to ensure symbols exist for fixer
+                            pdb.record_position_snapshot(pos, status, self.wallet_address, token_prices=None)
+                            # Ensure an entry exists
+                            pdb.check_and_record_entry(pos, status, self.wallet_address)
+                    except Exception:
+                        continue
+                pdb.close()
+            except Exception:
+                pass
+
+        # Open raw DB connection for the fixer
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+        except Exception:
+            return
+
+        # Run fixes
+        show_status = self.use_rich
+        if show_status:
+            console.print(f"[cyan]🔧 Auto-fixing entry values for {len(unique_active)} active position(s)...[/cyan]")
+        else:
+            print(f"🔧 Auto-fixing entry values for {len(unique_active)} active position(s)...")
+
+        for wallet, dex_name, token_id in unique_active:
+            pm = dex_to_pm.get(dex_name)
+            if not pm:
+                continue
+            try:
+                # Skip if entry already has a valid value to avoid heavy chain calls
+                try:
+                    cur = conn.execute(
+                        """
+                        SELECT entry_value_usd FROM position_entries
+                        WHERE wallet_address = ? AND dex_name = ? AND token_id = ?
+                        """,
+                        (wallet, dex_name, token_id)
+                    )
+                    row = cur.fetchone()
+                    if row and row[0] is not None and float(row[0]) > 0:
+                        continue
+                except Exception:
+                    pass
+
+                entry_fix.fix_position_entry(
+                    conn,
+                    self.blockchain,
+                    wallet,
+                    dex_name,
+                    token_id,
+                    pm,
+                    debug=self.debug_mode,
+                    dry_run=False
+                )
+            except Exception:
+                # Keep going on per-position errors
+                continue
+
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # Export for backward compatibility

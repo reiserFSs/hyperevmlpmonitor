@@ -1010,12 +1010,12 @@ class BlockchainManager:
         cache_key = (int(position["token_id"]), Web3.to_checksum_address(position["position_manager"]))
         if cache_key in self._initial_liquidity_cache:
             if self.debug_mode:
-                print(f"DEBUG {token_id_for_debug}: Returning cached entry data.", flush=True)
+                print(f"DEBUG {token_id_for_debug}: Returning cached entry data.")
             return self._initial_liquidity_cache[cache_key]
 
         if self.debug_mode:
-            print(f"DEBUG {token_id_for_debug}: ----------------------------------------------------", flush=True)
-            print(f"DEBUG {token_id_for_debug}: Starting historical entry fetch for token {token_id_for_debug}...", flush=True)
+            print(f"DEBUG {token_id_for_debug}: ----------------------------------------------------")
+            print(f"DEBUG {token_id_for_debug}: Starting historical entry fetch for token {token_id_for_debug}...")
 
         try:
             token_id = int(position["token_id"])
@@ -1026,7 +1026,7 @@ class BlockchainManager:
             creation_block = None
             current_block = self._rl_call(self.w3.eth.block_number)
             if self.debug_mode:
-                print(f"DEBUG {token_id_for_debug}: Current block is {current_block}. Searching last ~12 hours for mint event...", flush=True)
+                print(f"DEBUG {token_id_for_debug}: Current block is {current_block}. Searching last ~12 hours for mint event...")
 
             chunk_size = 2000
             # Reduced search range to ~12 hours (4000 blocks) to prevent hanging
@@ -1036,7 +1036,7 @@ class BlockchainManager:
                 
                 try:
                     if self.debug_mode:
-                        print(f"DEBUG {token_id_for_debug}: Searching for mint in blocks {from_block}-{end_block}...", flush=True)
+                        print(f"DEBUG {token_id_for_debug}: Searching for mint in blocks {from_block}-{end_block}...")
                     logs = self._rl_call(self.w3.eth.get_logs, {
                         'fromBlock': from_block,
                         'toBlock': end_block,
@@ -1046,22 +1046,22 @@ class BlockchainManager:
                     if logs:
                         creation_block = logs[0]['blockNumber']
                         if self.debug_mode:
-                            print(f"DEBUG {token_id_for_debug}: Found mint event in block range {from_block}-{end_block}. Creation Block: {creation_block}", flush=True)
+                            print(f"DEBUG {token_id_for_debug}: Found mint event in block range {from_block}-{end_block}. Creation Block: {creation_block}")
                         break 
                 except Exception as e:
                     if self.debug_mode:
-                        print(f"DEBUG {token_id_for_debug}: (Info) No mint event found in blocks {from_block}-{end_block}. Error: {e}", flush=True)
+                        print(f"DEBUG {token_id_for_debug}: (Info) No mint event found in blocks {from_block}-{end_block}. Error: {e}")
             
             if not creation_block:
                 if self.debug_mode:
-                    print(f"DEBUG {token_id_for_debug}: Mint event not found. Will rely on IncreaseLiquidity event to find block.", flush=True)
+                    print(f"DEBUG {token_id_for_debug}: Mint event not found. Will rely on IncreaseLiquidity event to find block.")
 
             # --- Get Initial Liquidity Amounts ---
             search_block_start = creation_block if creation_block else max(0, current_block - 4000)
             # Widen the search range slightly in case of block reorganization or timing issues
             search_block_end = creation_block + 50 if creation_block else current_block
             if self.debug_mode:
-                print(f"DEBUG {token_id_for_debug}: Searching for IncreaseLiquidity event in blocks {search_block_start}-{search_block_end}...", flush=True)
+                print(f"DEBUG {token_id_for_debug}: Searching for IncreaseLiquidity event in blocks {search_block_start}-{search_block_end}...")
 
             increase_logs = self._rl_call(self.w3.eth.get_logs, {
                 'fromBlock': search_block_start,
@@ -1072,7 +1072,7 @@ class BlockchainManager:
 
             if not increase_logs:
                 if self.debug_mode:
-                    print(f"DEBUG {token_id_for_debug}: CRITICAL - Could not find any IncreaseLiquidity event for token. Cannot determine entry.", flush=True)
+                    print(f"DEBUG {token_id_for_debug}: CRITICAL - Could not find any IncreaseLiquidity event for token. Cannot determine entry.")
                 self._initial_liquidity_cache[cache_key] = None
                 return None
 
@@ -1080,11 +1080,11 @@ class BlockchainManager:
             if not creation_block:
                  creation_block = first_increase['blockNumber']
                  if self.debug_mode:
-                    print(f"DEBUG {token_id_for_debug}: Using block {creation_block} from the first IncreaseLiquidity event.", flush=True)
+                    print(f"DEBUG {token_id_for_debug}: Using block {creation_block} from the first IncreaseLiquidity event.")
 
             # --- Extract Amounts and Timestamp ---
             if self.debug_mode:
-                print(f"DEBUG {token_id_for_debug}: Extracting data from IncreaseLiquidity event at block {creation_block}...", flush=True)
+                print(f"DEBUG {token_id_for_debug}: Extracting data from IncreaseLiquidity event at block {creation_block}...")
             data_bytes = bytes.fromhex(first_increase['data'][2:])
             amount0_wei = int.from_bytes(data_bytes[32:64], 'big')
             amount1_wei = int.from_bytes(data_bytes[64:96], 'big')
@@ -1097,7 +1097,7 @@ class BlockchainManager:
             blk = self._rl_call(self.w3.eth.get_block, creation_block)
             ts = int(blk['timestamp'])
             if self.debug_mode:
-                print(f"DEBUG {token_id_for_debug}: Initial amounts: {amount0:.4f} T0, {amount1:.4f} T1 at timestamp {ts}", flush=True)
+                print(f"DEBUG {token_id_for_debug}: Initial amounts: {amount0:.4f} T0, {amount1:.4f} T1 at timestamp {ts}")
 
             # --- Fetch Historical Price ---
             pool_address = position.get('pool_address')
@@ -1107,19 +1107,19 @@ class BlockchainManager:
                     position.get('fee'), position.get('factory_address'), position.get('dex_type', 'uniswap_v3')
                 )
             if self.debug_mode:
-                print(f"DEBUG {token_id_for_debug}: Pool address is {pool_address}. Fetching historical price...", flush=True)
+                print(f"DEBUG {token_id_for_debug}: Pool address is {pool_address}. Fetching historical price...")
 
             entry_price = None
             if pool_address:
                 entry_price = self._get_pool_price_at_block(pool_address, position.get('dex_type', 'uniswap_v3'), creation_block)
                 if self.debug_mode:
                     if entry_price is not None:
-                        print(f"DEBUG {token_id_for_debug}: Successfully fetched historical price at block {creation_block}: {entry_price:.6f}", flush=True)
+                        print(f"DEBUG {token_id_for_debug}: Successfully fetched historical price at block {creation_block}: {entry_price:.6f}")
                     else:
-                        print(f"DEBUG {token_id_for_debug}: FAILED to fetch historical price at block {creation_block}.", flush=True)
+                        print(f"DEBUG {token_id_for_debug}: FAILED to fetch historical price at block {creation_block}.")
             else:
                  if self.debug_mode:
-                    print(f"DEBUG {token_id_for_debug}: Could not determine pool address.", flush=True)
+                    print(f"DEBUG {token_id_for_debug}: Could not determine pool address.")
 
             # --- Calculate USD Value at Entry ---
             token0_symbol = position.get('token0_symbol')
@@ -1140,8 +1140,8 @@ class BlockchainManager:
                 entry_value_usd = amount0 * entry_token0_price_usd + amount1 * entry_token1_price_usd
             
             if self.debug_mode:
-                print(f"DEBUG {token_id_for_debug}: Final calculated entry value: ${entry_value_usd if entry_value_usd is not None else 'N/A'}", flush=True)
-                print(f"DEBUG {token_id_for_debug}: ----------------------------------------------------", flush=True)
+                print(f"DEBUG {token_id_for_debug}: Final calculated entry value: ${entry_value_usd if entry_value_usd is not None else 'N/A'}")
+                print(f"DEBUG {token_id_for_debug}: ----------------------------------------------------")
 
 
             result = {
@@ -1160,7 +1160,7 @@ class BlockchainManager:
         except Exception as e:
             if self.debug_mode:
                 import traceback
-                print(f"❌ DEBUG {token_id_for_debug}: CRITICAL ERROR in get_initial_position_entry: {e}", flush=True)
+                print(f"❌ DEBUG {token_id_for_debug}: CRITICAL ERROR in get_initial_position_entry: {e}")
                 traceback.print_exc()
             self._initial_liquidity_cache[cache_key] = None
             return None
