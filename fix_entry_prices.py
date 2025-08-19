@@ -27,6 +27,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from blockchain import BlockchainManager
 from config import load_config
 from price_utils import is_stablecoin
+from utils import tick_to_price
 
 
 def get_args():
@@ -104,6 +105,31 @@ def get_position_creation_block(blockchain, position_manager, token_id, debug=Fa
     return None
 
 
+def calculate_entry_price_from_position_range(tick_lower, tick_upper, token0_decimals, token1_decimals, debug=False):
+    """Calculate entry price from position's tick range using the geometric mean of the range bounds"""
+    try:
+        # Calculate prices at lower and upper bounds using 1.0001^tick formula
+        lower_price = tick_to_price(tick_lower, token0_decimals, token1_decimals)
+        upper_price = tick_to_price(tick_upper, token0_decimals, token1_decimals)
+        
+        # Use geometric mean of the range as the "entry price"
+        # This represents the center of the range where the position was likely created
+        entry_price = (lower_price * upper_price) ** 0.5
+        
+        if debug:
+            print(f"  Tick range: {tick_lower} to {tick_upper}")
+            print(f"  Lower price: {lower_price:.6f}")
+            print(f"  Upper price: {upper_price:.6f}")
+            print(f"  Entry price (geometric mean): {entry_price:.6f}")
+        
+        return entry_price, lower_price, upper_price
+        
+    except Exception as e:
+        if debug:
+            print(f"  Error calculating entry price from ticks: {e}")
+        return None, None, None
+
+
 def calculate_entry_price_from_amounts(token0_amount, token1_amount, token0_symbol, token1_symbol, debug=False):
     """Calculate entry price from token amounts, assuming position was created in-range"""
     if token0_amount <= 0 or token1_amount <= 0:
@@ -164,12 +190,11 @@ def fix_position_entry(conn, blockchain, wallet, dex, token_id, position_manager
     current_entry_value = entry['entry_value_usd']
     token0_symbol = snapshot['token0_symbol']
     token1_symbol = snapshot['token1_symbol']
-    pool_address = None
     
     print(f"  Pair: {token0_symbol}/{token1_symbol}")
     print(f"  Current entry: ${current_entry_value:.2f} ({entry_amount0:.6f}, {entry_amount1:.6f})")
     
-    # Try to get pool address from a recent position fetch
+    # Get position data to extract tick range and token information
     try:
         # Get pool data to find pool address
         position_manager_contract = blockchain.w3.eth.contract(
@@ -200,6 +225,12 @@ def fix_position_entry(conn, blockchain, wallet, dex, token_id, position_manager
         token0 = position_data[2]
         token1 = position_data[3]
         fee = position_data[4]
+        tick_lower = position_data[5]
+        tick_upper = position_data[6]
+        
+        if debug:
+            print(f"  Position data: token0={token0[:8]}..., token1={token1[:8]}..., fee={fee}")
+            print(f"  Tick range: {tick_lower} to {tick_upper}")
         
         # Get factory address
         factory_contract = blockchain.w3.eth.contract(
@@ -214,21 +245,59 @@ def fix_position_entry(conn, blockchain, wallet, dex, token_id, position_manager
         )
         factory_address = factory_contract.functions.factory().call()
         
-        # Get pool address - use correct DEX type
-        pool_address = blockchain.get_pool_address(token0, token1, fee, factory_address, dex_type)
-        if debug:
-            print(f"  Pool address: {pool_address}")
+        # Get token decimals for price calculations
+        token0_info = blockchain.get_enhanced_token_info(token0)
+        token1_info = blockchain.get_enhanced_token_info(token1)
+        
+        # Calculate entry price using the position's tick range (CORRECT METHOD)
+        entry_price, lower_price, upper_price = calculate_entry_price_from_position_range(
+            tick_lower, tick_upper, token0_info["decimals"], token1_info["decimals"], debug
+        )
+        
+        if not entry_price:
+            print("  Could not calculate entry price from tick range")
+            return
+            
+        print(f"  Entry price from position range: {entry_price:.6f}")
+        
+        # Calculate USD values based on entry price
+        token0_usd = None
+        token1_usd = None
+        
+        if is_stablecoin(token1_symbol):
+            token1_usd = 1.0
+            token0_usd = entry_price
+        elif is_stablecoin(token0_symbol):
+            token0_usd = 1.0
+            token1_usd = 1.0 / entry_price if entry_price > 0 else None
+        else:
+            print("  No stablecoin detected, cannot determine USD prices")
+            return
+            
+        if token0_usd and token1_usd and entry_amount0 > 0 and entry_amount1 > 0:
+            new_value = entry_amount0 * token0_usd + entry_amount1 * token1_usd
+            print(f"  New entry value: ${new_value:.2f} (token0=${token0_usd:.4f}, token1=${token1_usd:.4f})")
+            
+            if abs(new_value - current_entry_value) > 0.01:
+                if not dry_run:
+                    conn.execute("""
+                        UPDATE position_entries
+                        SET entry_value_usd = ?, entry_token0_price_usd = ?, entry_token1_price_usd = ?, entry_price = ?
+                        WHERE wallet_address = ? AND dex_name = ? AND token_id = ?
+                    """, (new_value, token0_usd, token1_usd, entry_price, wallet, dex, token_id))
+                    conn.commit()
+                    print("  ✅ Updated entry value")
+            else:
+                print("  Entry value already correct")
+        else:
+            print("  Missing entry amounts, cannot calculate value")
             
     except Exception as e:
         if debug:
-            print(f"  Error getting pool address: {e}")
-    
-    # Find creation block
-    creation_block = get_position_creation_block(blockchain, position_manager, token_id, debug)
-    
-    if not creation_block:
-        print("  Could not find creation block")
-        # Fall back to calculating from amounts
+            print(f"  Error getting position data: {e}")
+        
+        # Fallback to calculation from amounts if position data unavailable
+        print("  Falling back to calculation from entry amounts...")
         if entry_amount0 > 0 and entry_amount1 > 0:
             price, token0_usd, token1_usd = calculate_entry_price_from_amounts(
                 entry_amount0, entry_amount1, token0_symbol, token1_symbol, debug
@@ -245,95 +314,6 @@ def fix_position_entry(conn, blockchain, wallet, dex, token_id, position_manager
                     """, (new_value, token0_usd, token1_usd, wallet, dex, token_id))
                     conn.commit()
                     print("  ✅ Updated entry value")
-        return
-    
-    # Get historical price at creation
-    if pool_address:
-        try:
-            import time
-            print(f"  Getting historical price at block {creation_block}...")
-            
-            # Using rate-limited call
-            
-            # Get pool price at creation block using Algebra globalState
-            pool_contract = blockchain.w3.eth.contract(
-                address=Web3.to_checksum_address(pool_address),
-                abi=[{
-                    "inputs": [],
-                    "name": "globalState",
-                    "outputs": [
-                        {"name": "price", "type": "uint160"},
-                        {"name": "tick", "type": "int24"},
-                        {"name": "fee", "type": "uint16"},
-                        {"name": "timepointIndex", "type": "uint16"},
-                        {"name": "communityFeeToken0", "type": "uint8"},
-                        {"name": "communityFeeToken1", "type": "uint8"},
-                        {"name": "unlocked", "type": "bool"}
-                    ],
-                    "stateMutability": "view",
-                    "type": "function"
-                }]
-            )
-            
-            global_state = blockchain._rl_call(pool_contract.functions.globalState().call, block_identifier=creation_block)
-            sqrt_price_x96 = global_state[0]
-            
-            # Get token decimals
-            token0_info = blockchain.get_enhanced_token_info(token0)
-            token1_info = blockchain.get_enhanced_token_info(token1)
-            
-            # Calculate price
-            from utils import sqrt_price_to_price
-            historical_price = sqrt_price_to_price(sqrt_price_x96, token0_info["decimals"], token1_info["decimals"])
-            
-            print(f"  Historical pool price at block {creation_block}: {historical_price:.6f}")
-            
-            # Calculate USD values
-            token0_usd = None
-            token1_usd = None
-            
-            if is_stablecoin(token1_symbol):
-                token1_usd = 1.0
-                token0_usd = historical_price
-            elif is_stablecoin(token0_symbol):
-                token0_usd = 1.0
-                token1_usd = 1.0 / historical_price if historical_price > 0 else None
-                
-            if token0_usd and token1_usd and entry_amount0 > 0 and entry_amount1 > 0:
-                new_value = entry_amount0 * token0_usd + entry_amount1 * token1_usd
-                print(f"  New entry value: ${new_value:.2f} (token0=${token0_usd:.4f}, token1=${token1_usd:.4f})")
-                
-                if abs(new_value - current_entry_value) > 0.01:
-                    if not dry_run:
-                        conn.execute("""
-                            UPDATE position_entries
-                            SET entry_value_usd = ?, entry_token0_price_usd = ?, entry_token1_price_usd = ?, entry_price = ?
-                            WHERE wallet_address = ? AND dex_name = ? AND token_id = ?
-                        """, (new_value, token0_usd, token1_usd, historical_price, wallet, dex, token_id))
-                        conn.commit()
-                        print("  ✅ Updated entry value")
-                else:
-                    print("  Entry value already correct")
-                    
-        except Exception as e:
-            print(f"  Error getting historical price: {e}")
-            # Fall back to calculation from amounts
-            if entry_amount0 > 0 and entry_amount1 > 0:
-                price, token0_usd, token1_usd = calculate_entry_price_from_amounts(
-                    entry_amount0, entry_amount1, token0_symbol, token1_symbol, debug
-                )
-                if token0_usd and token1_usd:
-                    new_value = entry_amount0 * token0_usd + entry_amount1 * token1_usd
-                    print(f"  Calculated from amounts: ${new_value:.2f}")
-                    
-                    if not dry_run:
-                        conn.execute("""
-                            UPDATE position_entries
-                            SET entry_value_usd = ?, entry_token0_price_usd = ?, entry_token1_price_usd = ?
-                            WHERE wallet_address = ? AND dex_name = ? AND token_id = ?
-                        """, (new_value, token0_usd, token1_usd, wallet, dex, token_id))
-                        conn.commit()
-                        print("  ✅ Updated entry value")
 
 
 def main():
