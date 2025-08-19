@@ -276,6 +276,11 @@ class PositionDatabase:
             # Preferred order: explicit entry amounts -> theoretical center amounts -> current snapshot amounts
             entry_amount0 = status.get('entry_amount0')
             entry_amount1 = status.get('entry_amount1')
+            # Track whether amounts came from historical on-chain data
+            chain_entry_amounts_provided = (
+                (entry_amount0 is not None and entry_amount0 > 0) or
+                (entry_amount1 is not None and entry_amount1 > 0)
+            )
             
             # If we don't have explicit entry amounts from historical data, 
             # mark this position for later fix-up rather than using incorrect current data
@@ -332,86 +337,25 @@ class PositionDatabase:
                 token0_price_usd = status.get('entry_token0_price_usd')
                 token1_price_usd = status.get('entry_token1_price_usd')
             elif status.get('entry_token0_price_usd') is not None and status.get('entry_token1_price_usd') is not None:
-                token0_price_usd = status.get('entry_token0_price_usd')
-                token1_price_usd = status.get('entry_token1_price_usd')
-                entry_value_usd = float(entry_amount0) * float(token0_price_usd) + float(entry_amount1) * float(token1_price_usd)
+                # Only combine historical entry prices with historical entry AMOUNTS.
+                # If we don't have entry amounts from chain, do NOT multiply current amounts by historical prices.
+                if chain_entry_amounts_provided:
+                    token0_price_usd = status.get('entry_token0_price_usd')
+                    token1_price_usd = status.get('entry_token1_price_usd')
+                    entry_value_usd = float(entry_amount0) * float(token0_price_usd) + float(entry_amount1) * float(token1_price_usd)
             
-            # BUGFIX: Don't use current prices for entry value calculation!
-            # This was causing new positions to show incorrect PnL because entry_value_usd
-            # was calculated with current prices instead of historical entry prices.
-            # Leave entry_value_usd as None so the position will be marked for historical lookup.
-            # if (entry_value_usd is None or entry_value_usd <= 0) and token_prices:
-            #     token0_symbol = status.get('token0_symbol', '')
-            #     token1_symbol = status.get('token1_symbol', '')
-            #     if token0_symbol in token_prices:
-            #         token0_price_usd = token_prices[token0_symbol]
-            #     if token1_symbol in token_prices:
-            #         token1_price_usd = token_prices[token1_symbol]
-            #     if token0_price_usd is not None and token1_price_usd is not None:
-            #         entry_value_usd = float(entry_amount0) * float(token0_price_usd) + float(entry_amount1) * float(token1_price_usd)
-
-            # Final fallback: cautiously use center-of-range price ONLY if one side is a stablecoin
-            # This avoids assigning arbitrary USD values for non-stable pairs which caused spurious negative PnL
-            if (entry_value_usd is None or entry_value_usd <= 0) and status.get('entry_price_center'):
-                try:
-                    from price_utils import is_stablecoin
-                    t0 = status.get('token0_symbol', '')
-                    t1 = status.get('token1_symbol', '')
-                    center = float(status.get('entry_price_center') or 0)
-                    # If token1 is stable, token0 USD = center, token1 USD = 1
-                    if is_stablecoin(t1) and center > 0:
-                        entry_value_usd = float(entry_amount0) * center + float(entry_amount1)
-                        token0_price_usd = center
-                        token1_price_usd = 1.0
-                    # If token0 is stable, invert center to get token1 USD
-                    elif is_stablecoin(t0) and center > 0:
-                        inv_center = (1.0 / center) if center > 0 else 0.0
-                        entry_value_usd = float(entry_amount0) * 1.0 + float(entry_amount1) * inv_center
-                        token0_price_usd = 1.0
-                        token1_price_usd = inv_center
-                    # Otherwise, leave entry_value_usd unset so PnL is deferred until proper data exists
-                except Exception:
-                    pass
-
-            # If still missing, use current observed amounts and treat any stable side as $1
+            # If historical data was found, use it
             if entry_value_usd is None or entry_value_usd <= 0:
-                try:
-                    t0 = status.get('token0_symbol', '')
-                    t1 = status.get('token1_symbol', '')
-                    # Prefer explicit prices provided in status for stable pairs
-                    if token0_price_usd is None and status.get('entry_token0_price_usd') is not None:
-                        token0_price_usd = status.get('entry_token0_price_usd')
-                    if token1_price_usd is None and status.get('entry_token1_price_usd') is not None:
-                        token1_price_usd = status.get('entry_token1_price_usd')
-                    # As a last resort, if one token is a stablecoin, assume $1
-                    from price_utils import is_stablecoin
-                    if token0_price_usd is None and is_stablecoin(t0):
-                        token0_price_usd = 1.0
-                    if token1_price_usd is None and is_stablecoin(t1):
-                        token1_price_usd = 1.0
-                    if token0_price_usd is not None and token1_price_usd is not None:
-                        entry_value_usd = float(entry_amount0) * float(token0_price_usd) + float(entry_amount1) * float(token1_price_usd)
-                except Exception:
-                    pass
+                if status.get('historical_entry_value_usd'):
+                    entry_value_usd = status.get('historical_entry_value_usd')
+                    token0_price_usd = status.get('historical_token0_price_usd')
+                    token1_price_usd = status.get('historical_token1_price_usd')
 
-            # New baseline for first-seen entries with stable exposure: if we still don't have
-            # a reliable historical entry, but we do have live token USD prices now, baseline
-            # the entry USD value at first detection. This avoids spurious immediate negative PnL
-            # on brand-new positions, and will be backfilled later if historical data becomes available.
-            if (entry_value_usd is None or entry_value_usd <= 0) and token_prices:
-                try:
-                    from price_utils import is_stablecoin
-                    t0 = status.get('token0_symbol', '')
-                    t1 = status.get('token1_symbol', '')
-                    p0 = token_prices.get(t0)
-                    p1 = token_prices.get(t1)
-                    if p0 is not None and p1 is not None and (is_stablecoin(t0) or is_stablecoin(t1)):
-                        entry_value_usd = float(entry_amount0) * float(p0) + float(entry_amount1) * float(p1)
-                        token0_price_usd = p0
-                        token1_price_usd = p1
-                except Exception:
-                    pass
-            
+            # REMOVED: All fallback estimation logic has been removed.
+            # The monitor now relies exclusively on the get_initial_position_entry
+            # function in blockchain.py to provide the true historical entry data.
+            # If historical data cannot be found, PnL will be deferred (remain $0).
+
             # Store the acquired timestamp from blockchain data if available
             acquired_ts = status.get('acquired_timestamp')
             
@@ -488,6 +432,68 @@ class PositionDatabase:
                         print(f"Updated entry for {position['dex_name']} #{position['token_id']}: ")
                         print(f"  Old value: ${old_value:.2f}, New value: ${precise_entry_value:.2f}")
                     return
+            
+            # Auto-baseline existing entries that look incorrect for stable pairs
+            # This handles cases where the entry was created before proper baseline logic
+            if token_prices and existing['entry_value_usd'] is not None:
+                try:
+                    from price_utils import is_stablecoin
+                    t0s = status.get('token0_symbol', '')
+                    t1s = status.get('token1_symbol', '')
+                    p0_live = token_prices.get(t0s)
+                    p1_live = token_prices.get(t1s)
+                    
+                    if p0_live is not None and p1_live is not None and (is_stablecoin(t0s) or is_stablecoin(t1s)):
+                        # Calculate what current amounts would be worth at current USD prices
+                        current_amount0 = status.get('amount0', 0) or 0
+                        current_amount1 = status.get('amount1', 0) or 0
+                        current_usd_value = float(current_amount0) * float(p0_live) + float(current_amount1) * float(p1_live)
+                        
+                        old_entry_value = float(existing['entry_value_usd'])
+                        
+                        # If entry value is significantly higher than current value (suggesting wrong baseline),
+                        # and the position is relatively recent (< 7 days), auto-correct to current value
+                        try:
+                            entry_ts = existing.get('entry_timestamp')
+                            if entry_ts:
+                                from datetime import datetime, timedelta
+                                entry_dt = datetime.fromisoformat(entry_ts)
+                                age_hours = (datetime.now() - entry_dt).total_seconds() / 3600
+                                
+                                # For positions < 7 days old where entry is >20% higher than current
+                                if (age_hours < 168 and old_entry_value > current_usd_value * 1.2):
+                                    # Baseline to current value minus any unclaimed fees
+                                    unclaimed_fees_usd = 0
+                                    fee0 = status.get('fee_amount0', 0) or 0
+                                    fee1 = status.get('fee_amount1', 0) or 0
+                                    unclaimed_fees_usd = float(fee0) * float(p0_live) + float(fee1) * float(p1_live)
+                                    
+                                    new_entry_value = current_usd_value - unclaimed_fees_usd
+                                    
+                                    self.conn.execute('''
+                                        UPDATE position_entries SET
+                                            entry_value_usd = ?,
+                                            entry_token0_price_usd = ?,
+                                            entry_token1_price_usd = ?
+                                        WHERE wallet_address = ? AND dex_name = ? AND token_id = ?
+                                    ''', (
+                                        new_entry_value,
+                                        p0_live,
+                                        p1_live,
+                                        wallet_address,
+                                        position['dex_name'],
+                                        position['token_id']
+                                    ))
+                                    self.conn.commit()
+                                    
+                                    if self.debug_mode:
+                                        print(f"Auto-baselined entry for {position['dex_name']} #{position['token_id']}")
+                                        print(f"  Old: ${old_entry_value:.2f}, New: ${new_entry_value:.2f}")
+                                    return
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             
             # Original backfill logic for other cases
             entry_amount0 = status.get('entry_amount0')

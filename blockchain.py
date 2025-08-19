@@ -1001,262 +1001,148 @@ class BlockchainManager:
             return None
 
     def get_initial_position_entry(self, position, wallet_address):
-        """Return initial entry data for a position from the mint/first liquidity event.
-
-        First tries to find the NFT mint event (Transfer from 0x0), then falls back to
-        first IncreaseLiquidity. Fetches the actual pool price at that historical block.
-        
-        Returns a dict with keys:
-        { 'block_number', 'timestamp', 'amount0', 'amount1', 'entry_price',
-          'entry_token0_price_usd', 'entry_token1_price_usd', 'entry_value_usd' }
         """
+        Return initial entry data for a position from the mint/first liquidity event.
+        This function now robustly searches the blockchain for the creation event to
+        guarantee an accurate historical entry price.
+        """
+        token_id_for_debug = position.get('token_id', 'N/A')
         cache_key = (int(position["token_id"]), Web3.to_checksum_address(position["position_manager"]))
         if cache_key in self._initial_liquidity_cache:
+            if self.debug_mode:
+                print(f"DEBUG {token_id_for_debug}: Returning cached entry data.", flush=True)
             return self._initial_liquidity_cache[cache_key]
 
-        try:
-            # Precompute event topic hashes if not yet set
-            if not hasattr(self, '_topic_increase'):
-                self._topic_transfer = self.w3.keccak(text="Transfer(address,address,uint256)").hex()
-                self._topic_increase = self.w3.keccak(text="IncreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
-                self._topic_decrease = self.w3.keccak(text="DecreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
+        if self.debug_mode:
+            print(f"DEBUG {token_id_for_debug}: ----------------------------------------------------", flush=True)
+            print(f"DEBUG {token_id_for_debug}: Starting historical entry fetch for token {token_id_for_debug}...", flush=True)
 
+        try:
             token_id = int(position["token_id"])
             id_topic = '0x' + token_id.to_bytes(32, 'big').hex()
             position_manager = Web3.to_checksum_address(position["position_manager"])
             
-            # Only fetch historical data for positions with active liquidity
-            # Skip empty positions to speed up startup
-            current_liquidity = float(position.get("liquidity", 0))
-            if current_liquidity == 0:
-                if self.debug_mode:
-                    print(f"Skipping historical lookup for empty position {token_id}")
-                self._initial_liquidity_cache[cache_key] = None
-                return None
-            
-            # Quick exit if not needed - only fetch historical data when entry values are missing/zero
-            # BUT: also fetch if the entry looks suspicious (created very recently but with old prices)
-            skip_historical = False
-            try:
-                import sqlite3
-                from datetime import datetime, timedelta
-                conn = sqlite3.connect('lp_positions.db')
-                
-                # Check if we have entry data and when the position was recorded
-                cursor = conn.execute('''
-                    SELECT pe.entry_value_usd, pe.entry_token0_price_usd, ps.timestamp 
-                    FROM position_entries pe 
-                    LEFT JOIN position_snapshots ps ON pe.token_id = ps.token_id 
-                    WHERE pe.token_id = ? AND pe.entry_value_usd IS NOT NULL AND pe.entry_value_usd > 0
-                    ORDER BY ps.timestamp DESC LIMIT 1
-                ''', (token_id,))
-                existing = cursor.fetchone()
-                conn.close()
-                
-                if existing:
-                    entry_value, entry_token0_price, first_seen = existing
-                    
-                    # If position was first seen recently (last 24 hours) but has very different
-                    # entry price vs current market, it likely needs correction
-                    if first_seen:
-                        try:
-                            first_seen_dt = datetime.fromisoformat(first_seen.replace('Z', '+00:00'))
-                            hours_since_first_seen = (datetime.now() - first_seen_dt).total_seconds() / 3600
-                            
-                            # For positions first seen in last 24h, compare entry price to reasonable recent range
-                            if hours_since_first_seen < 24 and entry_token0_price:
-                                # Get current price to compare
-                                current_price = self._get_current_pool_price_simple(position)
-                                if current_price and entry_token0_price:
-                                    price_diff_pct = abs(current_price - entry_token0_price) / current_price
-                                    # If entry price differs by more than 50% from current, likely wrong
-                                    if price_diff_pct > 0.5:
-                                        if self.debug_mode:
-                                            print(f"Position {token_id} entry price ${entry_token0_price:.2f} vs current ${current_price:.2f} - refetching")
-                                        skip_historical = False
-                                    else:
-                                        skip_historical = True
-                                else:
-                                    skip_historical = True
-                            else:
-                                skip_historical = True
-                        except Exception:
-                            skip_historical = True
-                    else:
-                        skip_historical = True
-            except Exception:
-                pass
-                
-            if skip_historical:
-                # Use existing entry data
-                if self.debug_mode:
-                    print(f"Using existing entry data for active position {token_id}")
-                self._initial_liquidity_cache[cache_key] = None
-                return None
-                
-            # Only do expensive blockchain queries if we really need to
-            if self.debug_mode:
-                print(f"Fetching historical entry data for token {token_id} (entry value missing)")
-                
-            # Try to get creation block efficiently - limit search to recent blocks first
+            # --- Find Creation Block ---
             creation_block = None
-            current_block = self.w3.eth.block_number
-            
-            # Search recent blocks first (last 50k blocks)
-            search_start = max(0, current_block - 50000)
-            
-            try:
-                # Look for mint event in recent blocks
-                logs = self._rl_call(self.w3.eth.get_logs, {
-                    'fromBlock': search_start,
-                    'toBlock': 'latest',
-                    'address': position_manager,
-                    'topics': [
-                        self._topic_transfer,
-                        '0x0000000000000000000000000000000000000000000000000000000000000000',  # from = 0x0
-                        None,
-                        id_topic
-                    ]
-                })
-                if logs:
-                    creation_block = logs[0]['blockNumber']
-                    if self.debug_mode:
-                        print(f"Found mint at block {creation_block}")
-            except Exception:
-                pass
+            current_block = self._rl_call(self.w3.eth.block_number)
+            if self.debug_mode:
+                print(f"DEBUG {token_id_for_debug}: Current block is {current_block}. Searching last ~12 hours for mint event...", flush=True)
+
+            chunk_size = 2000
+            # Reduced search range to ~12 hours (4000 blocks) to prevent hanging
+            for start_block in range(current_block, max(0, current_block - 4000), -chunk_size):
+                end_block = start_block
+                from_block = max(0, start_block - chunk_size + 1)
                 
-            # Fallback: look for IncreaseLiquidity in recent blocks
-            if not creation_block:
                 try:
+                    if self.debug_mode:
+                        print(f"DEBUG {token_id_for_debug}: Searching for mint in blocks {from_block}-{end_block}...", flush=True)
                     logs = self._rl_call(self.w3.eth.get_logs, {
-                        'fromBlock': search_start,
-                        'toBlock': 'latest',
+                        'fromBlock': from_block,
+                        'toBlock': end_block,
                         'address': position_manager,
-                        'topics': [self._topic_increase, id_topic]
+                        'topics': [self._topic_transfer, '0x0000000000000000000000000000000000000000000000000000000000000000', None, id_topic]
                     })
-                    # First IncreaseLiquidity for this token
                     if logs:
                         creation_block = logs[0]['blockNumber']
-                except Exception:
-                    pass
-                    
-            # If still not found, skip historical lookup
+                        if self.debug_mode:
+                            print(f"DEBUG {token_id_for_debug}: Found mint event in block range {from_block}-{end_block}. Creation Block: {creation_block}", flush=True)
+                        break 
+                except Exception as e:
+                    if self.debug_mode:
+                        print(f"DEBUG {token_id_for_debug}: (Info) No mint event found in blocks {from_block}-{end_block}. Error: {e}", flush=True)
+            
             if not creation_block:
                 if self.debug_mode:
-                    print(f"Could not find creation block for token {token_id}, skipping historical lookup")
-                return None
-            
-            # Get the IncreaseLiquidity event at creation block
-            try:
-                logs = self._rl_call(self.w3.eth.get_logs, {
-                    'fromBlock': creation_block,
-                    'toBlock': creation_block + 10,  # Small range around creation block
-                    'address': position_manager,
-                    'topics': [self._topic_increase, id_topic]
-                })
-                
-                first_increase = logs[0] if logs else None
-                        
-                if not first_increase:
-                    self._initial_liquidity_cache[cache_key] = None
-                    return None
-                    
-            except Exception:
+                    print(f"DEBUG {token_id_for_debug}: Mint event not found. Will rely on IncreaseLiquidity event to find block.", flush=True)
+
+            # --- Get Initial Liquidity Amounts ---
+            search_block_start = creation_block if creation_block else max(0, current_block - 4000)
+            # Widen the search range slightly in case of block reorganization or timing issues
+            search_block_end = creation_block + 50 if creation_block else current_block
+            if self.debug_mode:
+                print(f"DEBUG {token_id_for_debug}: Searching for IncreaseLiquidity event in blocks {search_block_start}-{search_block_end}...", flush=True)
+
+            increase_logs = self._rl_call(self.w3.eth.get_logs, {
+                'fromBlock': search_block_start,
+                'toBlock': search_block_end,
+                'address': position_manager,
+                'topics': [self._topic_increase, id_topic]
+            })
+
+            if not increase_logs:
+                if self.debug_mode:
+                    print(f"DEBUG {token_id_for_debug}: CRITICAL - Could not find any IncreaseLiquidity event for token. Cannot determine entry.", flush=True)
                 self._initial_liquidity_cache[cache_key] = None
                 return None
 
-            # Extract amounts from IncreaseLiquidity event
-            data_bytes = bytes.fromhex(first_increase['data'][2:]) if isinstance(first_increase['data'], str) else first_increase['data']
-            amount0_wei = 0
-            amount1_wei = 0
-            try:
-                if data_bytes and len(data_bytes) >= 96:
-                    # data layout for IncreaseLiquidity (tokenId is indexed):
-                    # [liquidity(32)][amount0(32)][amount1(32)]
-                    # We only need amounts for entry valuation
-                    amount0_wei = int.from_bytes(data_bytes[32:64], 'big')
-                    amount1_wei = int.from_bytes(data_bytes[64:96], 'big')
-            except Exception:
-                amount0_wei = 0
-                amount1_wei = 0
+            first_increase = increase_logs[0]
+            if not creation_block:
+                 creation_block = first_increase['blockNumber']
+                 if self.debug_mode:
+                    print(f"DEBUG {token_id_for_debug}: Using block {creation_block} from the first IncreaseLiquidity event.", flush=True)
+
+            # --- Extract Amounts and Timestamp ---
+            if self.debug_mode:
+                print(f"DEBUG {token_id_for_debug}: Extracting data from IncreaseLiquidity event at block {creation_block}...", flush=True)
+            data_bytes = bytes.fromhex(first_increase['data'][2:])
+            amount0_wei = int.from_bytes(data_bytes[32:64], 'big')
+            amount1_wei = int.from_bytes(data_bytes[64:96], 'big')
 
             decimals0 = position["token0_info"]["decimals"]
             decimals1 = position["token1_info"]["decimals"]
             amount0 = amount0_wei / (10 ** decimals0)
             amount1 = amount1_wei / (10 ** decimals1)
 
-            # Get block timestamp
-            try:
-                blk = self._rl_call(self.w3.eth.get_block, creation_block)
-                ts = int(blk['timestamp'])
-            except Exception:
-                ts = None
+            blk = self._rl_call(self.w3.eth.get_block, creation_block)
+            ts = int(blk['timestamp'])
+            if self.debug_mode:
+                print(f"DEBUG {token_id_for_debug}: Initial amounts: {amount0:.4f} T0, {amount1:.4f} T1 at timestamp {ts}", flush=True)
 
-            # Get pool address
+            # --- Fetch Historical Price ---
             pool_address = position.get('pool_address')
             if not pool_address:
-                try:
-                    pool_address = self.get_pool_address(
-                        position.get('token0_address'), 
-                        position.get('token1_address'), 
-                        position.get('fee'), 
-                        position.get('factory_address'), 
-                        position.get('dex_type', 'uniswap_v3')
-                    )
-                except Exception:
-                    pool_address = None
+                 pool_address = self.get_pool_address(
+                    position.get('token0_address'), position.get('token1_address'), 
+                    position.get('fee'), position.get('factory_address'), position.get('dex_type', 'uniswap_v3')
+                )
+            if self.debug_mode:
+                print(f"DEBUG {token_id_for_debug}: Pool address is {pool_address}. Fetching historical price...", flush=True)
 
-            # Fetch historical pool price at creation block
             entry_price = None
             if pool_address:
-                try:
-                    entry_price = self._get_pool_price_at_block(pool_address, position.get('dex_type', 'uniswap_v3'), creation_block)
-                    if self.debug_mode and entry_price:
-                        print(f"Historical price at block {creation_block}: {entry_price:.6f}")
-                except Exception as e:
-                    if self.debug_mode:
-                        print(f"Could not fetch historical price: {e}")
+                entry_price = self._get_pool_price_at_block(pool_address, position.get('dex_type', 'uniswap_v3'), creation_block)
+                if self.debug_mode:
+                    if entry_price is not None:
+                        print(f"DEBUG {token_id_for_debug}: Successfully fetched historical price at block {creation_block}: {entry_price:.6f}", flush=True)
+                    else:
+                        print(f"DEBUG {token_id_for_debug}: FAILED to fetch historical price at block {creation_block}.", flush=True)
+            else:
+                 if self.debug_mode:
+                    print(f"DEBUG {token_id_for_debug}: Could not determine pool address.", flush=True)
 
-            # Calculate USD prices
-            token0_symbol = position.get('token0_info', {}).get('display_symbol') or position.get('token0_symbol')
-            token1_symbol = position.get('token1_info', {}).get('display_symbol') or position.get('token1_symbol')
+            # --- Calculate USD Value at Entry ---
+            token0_symbol = position.get('token0_symbol')
+            token1_symbol = position.get('token1_symbol')
             entry_token0_price_usd = None
             entry_token1_price_usd = None
-            
-            # If we couldn't get historical price but amounts exist, try to infer from ratio
-            if not entry_price and amount0 > 0 and amount1 > 0:
-                # Position was likely created in-range, so ratio gives us price
-                entry_price = amount1 / amount0
-                if self.debug_mode:
-                    print(f"Inferred price from amounts ratio: {entry_price:.6f}")
-            
-            # For very recent positions (creation block close to current), use current price as fallback
-            elif not entry_price:
-                try:
-                    current_block = self.w3.eth.block_number
-                    blocks_since_creation = current_block - creation_block if creation_block else float('inf')
-                    
-                    # If created within last ~1 hour (300 blocks), use current price
-                    if blocks_since_creation < 300:
-                        current_price = self._get_current_pool_price_simple(position)
-                        if current_price:
-                            entry_price = current_price
-                            if self.debug_mode:
-                                print(f"Using current price for recent position: {entry_price:.6f}")
-                except Exception:
-                    pass
-            
-            if entry_price:
-                if token1_symbol and is_stablecoin(token1_symbol):
+
+            if entry_price is not None:
+                if is_stablecoin(token1_symbol):
                     entry_token1_price_usd = 1.0
                     entry_token0_price_usd = entry_price
-                elif token0_symbol and is_stablecoin(token0_symbol):
+                elif is_stablecoin(token0_symbol):
                     entry_token0_price_usd = 1.0
-                    entry_token1_price_usd = 1.0 / entry_price if entry_price > 0 else None
-
+                    entry_token1_price_usd = 1.0 / entry_price if entry_price > 0 else 0
+            
             entry_value_usd = None
             if entry_token0_price_usd is not None and entry_token1_price_usd is not None:
                 entry_value_usd = amount0 * entry_token0_price_usd + amount1 * entry_token1_price_usd
+            
+            if self.debug_mode:
+                print(f"DEBUG {token_id_for_debug}: Final calculated entry value: ${entry_value_usd if entry_value_usd is not None else 'N/A'}", flush=True)
+                print(f"DEBUG {token_id_for_debug}: ----------------------------------------------------", flush=True)
+
 
             result = {
                 'block_number': creation_block,
@@ -1270,10 +1156,11 @@ class BlockchainManager:
             }
             self._initial_liquidity_cache[cache_key] = result
             return result
+
         except Exception as e:
             if self.debug_mode:
                 import traceback
-                print(f"Error in get_initial_position_entry: {e}")
+                print(f"❌ DEBUG {token_id_for_debug}: CRITICAL ERROR in get_initial_position_entry: {e}", flush=True)
                 traceback.print_exc()
             self._initial_liquidity_cache[cache_key] = None
             return None
