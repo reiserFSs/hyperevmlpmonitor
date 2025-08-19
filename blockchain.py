@@ -958,6 +958,16 @@ class BlockchainManager:
             pass
         return None
 
+    def _get_current_pool_price_simple(self, position):
+        """Get current pool price for position comparison (simple version)"""
+        try:
+            status = self.check_position_status(position, position.get('wallet_address', ''))
+            if status:
+                return status.get('current_price')
+        except Exception:
+            pass
+        return None
+
     def _get_pool_price_at_block(self, pool_address, dex_type, block_number):
         """Return pool price (token0 in terms of token1) at a specific block.
 
@@ -1025,18 +1035,55 @@ class BlockchainManager:
                 return None
             
             # Quick exit if not needed - only fetch historical data when entry values are missing/zero
+            # BUT: also fetch if the entry looks suspicious (created very recently but with old prices)
             skip_historical = False
             try:
                 import sqlite3
+                from datetime import datetime, timedelta
                 conn = sqlite3.connect('lp_positions.db')
+                
+                # Check if we have entry data and when the position was recorded
                 cursor = conn.execute('''
-                    SELECT entry_value_usd FROM position_entries 
-                    WHERE token_id = ? AND entry_value_usd IS NOT NULL AND entry_value_usd > 0
+                    SELECT pe.entry_value_usd, pe.entry_token0_price_usd, ps.timestamp 
+                    FROM position_entries pe 
+                    LEFT JOIN position_snapshots ps ON pe.token_id = ps.token_id 
+                    WHERE pe.token_id = ? AND pe.entry_value_usd IS NOT NULL AND pe.entry_value_usd > 0
+                    ORDER BY ps.timestamp DESC LIMIT 1
                 ''', (token_id,))
                 existing = cursor.fetchone()
                 conn.close()
+                
                 if existing:
-                    skip_historical = True
+                    entry_value, entry_token0_price, first_seen = existing
+                    
+                    # If position was first seen recently (last 24 hours) but has very different
+                    # entry price vs current market, it likely needs correction
+                    if first_seen:
+                        try:
+                            first_seen_dt = datetime.fromisoformat(first_seen.replace('Z', '+00:00'))
+                            hours_since_first_seen = (datetime.now() - first_seen_dt).total_seconds() / 3600
+                            
+                            # For positions first seen in last 24h, compare entry price to reasonable recent range
+                            if hours_since_first_seen < 24 and entry_token0_price:
+                                # Get current price to compare
+                                current_price = self._get_current_pool_price_simple(position)
+                                if current_price and entry_token0_price:
+                                    price_diff_pct = abs(current_price - entry_token0_price) / current_price
+                                    # If entry price differs by more than 50% from current, likely wrong
+                                    if price_diff_pct > 0.5:
+                                        if self.debug_mode:
+                                            print(f"Position {token_id} entry price ${entry_token0_price:.2f} vs current ${current_price:.2f} - refetching")
+                                        skip_historical = False
+                                    else:
+                                        skip_historical = True
+                                else:
+                                    skip_historical = True
+                            else:
+                                skip_historical = True
+                        except Exception:
+                            skip_historical = True
+                    else:
+                        skip_historical = True
             except Exception:
                 pass
                 
@@ -1182,6 +1229,22 @@ class BlockchainManager:
                 entry_price = amount1 / amount0
                 if self.debug_mode:
                     print(f"Inferred price from amounts ratio: {entry_price:.6f}")
+            
+            # For very recent positions (creation block close to current), use current price as fallback
+            elif not entry_price:
+                try:
+                    current_block = self.w3.eth.block_number
+                    blocks_since_creation = current_block - creation_block if creation_block else float('inf')
+                    
+                    # If created within last ~1 hour (300 blocks), use current price
+                    if blocks_since_creation < 300:
+                        current_price = self._get_current_pool_price_simple(position)
+                        if current_price:
+                            entry_price = current_price
+                            if self.debug_mode:
+                                print(f"Using current price for recent position: {entry_price:.6f}")
+                except Exception:
+                    pass
             
             if entry_price:
                 if token1_symbol and is_stablecoin(token1_symbol):

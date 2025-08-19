@@ -276,9 +276,52 @@ class PositionDatabase:
             # Preferred order: explicit entry amounts -> theoretical center amounts -> current snapshot amounts
             entry_amount0 = status.get('entry_amount0')
             entry_amount1 = status.get('entry_amount1')
-            if entry_amount0 is None or entry_amount1 is None or (entry_amount0 == 0 and entry_amount1 == 0):
-                entry_amount0 = status.get('theoretical_amount0', status.get('amount0'))
-                entry_amount1 = status.get('theoretical_amount1', status.get('amount1'))
+            
+            # If we don't have explicit entry amounts from historical data, 
+            # mark this position for later fix-up rather than using incorrect current data
+            has_historical_data = (entry_amount0 is not None and entry_amount1 is not None and 
+                                 (entry_amount0 > 0 or entry_amount1 > 0))
+            
+            if not has_historical_data:
+                # For new positions without historical data, we have two strategies:
+                # 1. If this is a very recent position (last few hours), use current amounts/prices
+                # 2. Otherwise, mark for later historical lookup
+                
+                from datetime import datetime, timedelta
+                is_very_recent = False
+                
+                # Check if position was acquired very recently (last 2 hours)
+                acquired_ts = status.get('acquired_timestamp')
+                if acquired_ts:
+                    try:
+                        acquired_dt = datetime.fromtimestamp(float(acquired_ts))
+                        hours_since_acquired = (datetime.now() - acquired_dt).total_seconds() / 3600
+                        is_very_recent = hours_since_acquired < 2.0
+                    except Exception:
+                        pass
+                
+                if is_very_recent:
+                    # Use current amounts and prices for very recent positions
+                    entry_amount0 = status.get('amount0', 0)
+                    entry_amount1 = status.get('amount1', 0)
+                    
+                    # Calculate entry value using current prices (reasonable for new positions)
+                    if token_prices:
+                        token0_symbol = status.get('token0_symbol', '')
+                        token1_symbol = status.get('token1_symbol', '')
+                        if token0_symbol in token_prices and token1_symbol in token_prices:
+                            token0_price_usd = token_prices[token0_symbol]
+                            token1_price_usd = token_prices[token1_symbol]
+                            entry_value_usd = float(entry_amount0) * float(token0_price_usd) + float(entry_amount1) * float(token1_price_usd)
+                else:
+                    # For older positions without historical data, use current amounts as placeholder
+                    # but mark entry_value_usd as None to signal this needs historical lookup
+                    entry_amount0 = status.get('amount0', 0)
+                    entry_amount1 = status.get('amount1', 0)
+                    entry_value_usd = None
+                    token0_price_usd = None
+                    token1_price_usd = None
+                
             # Normalize amounts
             entry_amount0 = 0 if entry_amount0 is None else float(entry_amount0)
             entry_amount1 = 0 if entry_amount1 is None else float(entry_amount1)
@@ -354,6 +397,13 @@ class PositionDatabase:
                 token1_price_usd,
                 acquired_ts
             ))
+            
+            # If this position lacks proper entry data, mark it for automatic fixing
+            if entry_value_usd is None:
+                if hasattr(self, '_positions_needing_fix'):
+                    self._positions_needing_fix.add((wallet_address, position['dex_name'], position['token_id']))
+                else:
+                    self._positions_needing_fix = {(wallet_address, position['dex_name'], position['token_id'])}
             
             self.conn.commit()
         else:
@@ -573,8 +623,12 @@ class PositionDatabase:
         amt1_now = 0 if amt1_now is None else amt1_now
         current_value = (amt0_now * float(token0_price_usd)) + (amt1_now * float(token1_price_usd))
         
-        # Entry value
+        # Entry value - if None, this position needs proper historical entry data
         entry_value = entry['entry_value_usd'] if entry['entry_value_usd'] is not None else 0
+        
+        # Skip PnL calculation for positions that don't have proper entry data yet
+        if entry['entry_value_usd'] is None or entry['entry_value_usd'] <= 0:
+            return None
         
         # Calculate what we would have if we just held the tokens (HODL)
         ent_amt0 = entry['entry_amount0'] if entry['entry_amount0'] is not None else 0
