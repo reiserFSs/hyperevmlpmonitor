@@ -336,23 +336,42 @@ class PositionDatabase:
                 token1_price_usd = status.get('entry_token1_price_usd')
                 entry_value_usd = float(entry_amount0) * float(token0_price_usd) + float(entry_amount1) * float(token1_price_usd)
             
-            if (entry_value_usd is None or entry_value_usd <= 0) and token_prices:
-                token0_symbol = status.get('token0_symbol', '')
-                token1_symbol = status.get('token1_symbol', '')
-                if token0_symbol in token_prices:
-                    token0_price_usd = token_prices[token0_symbol]
-                if token1_symbol in token_prices:
-                    token1_price_usd = token_prices[token1_symbol]
-                if token0_price_usd is not None and token1_price_usd is not None:
-                    entry_value_usd = float(entry_amount0) * float(token0_price_usd) + float(entry_amount1) * float(token1_price_usd)
+            # BUGFIX: Don't use current prices for entry value calculation!
+            # This was causing new positions to show incorrect PnL because entry_value_usd
+            # was calculated with current prices instead of historical entry prices.
+            # Leave entry_value_usd as None so the position will be marked for historical lookup.
+            # if (entry_value_usd is None or entry_value_usd <= 0) and token_prices:
+            #     token0_symbol = status.get('token0_symbol', '')
+            #     token1_symbol = status.get('token1_symbol', '')
+            #     if token0_symbol in token_prices:
+            #         token0_price_usd = token_prices[token0_symbol]
+            #     if token1_symbol in token_prices:
+            #         token1_price_usd = token_prices[token1_symbol]
+            #     if token0_price_usd is not None and token1_price_usd is not None:
+            #         entry_value_usd = float(entry_amount0) * float(token0_price_usd) + float(entry_amount1) * float(token1_price_usd)
 
-            # Final fallback: if still missing, use center-of-range price approximation when we have one
+            # Final fallback: cautiously use center-of-range price ONLY if one side is a stablecoin
+            # This avoids assigning arbitrary USD values for non-stable pairs which caused spurious negative PnL
             if (entry_value_usd is None or entry_value_usd <= 0) and status.get('entry_price_center'):
-                center = float(status.get('entry_price_center') or 0)
-                # We value amounts using the center price: token0*center + token1
-                entry_value_usd = float(entry_amount0) * center + float(entry_amount1)
-                token0_price_usd = center
-                token1_price_usd = 1.0
+                try:
+                    from price_utils import is_stablecoin
+                    t0 = status.get('token0_symbol', '')
+                    t1 = status.get('token1_symbol', '')
+                    center = float(status.get('entry_price_center') or 0)
+                    # If token1 is stable, token0 USD = center, token1 USD = 1
+                    if is_stablecoin(t1) and center > 0:
+                        entry_value_usd = float(entry_amount0) * center + float(entry_amount1)
+                        token0_price_usd = center
+                        token1_price_usd = 1.0
+                    # If token0 is stable, invert center to get token1 USD
+                    elif is_stablecoin(t0) and center > 0:
+                        inv_center = (1.0 / center) if center > 0 else 0.0
+                        entry_value_usd = float(entry_amount0) * 1.0 + float(entry_amount1) * inv_center
+                        token0_price_usd = 1.0
+                        token1_price_usd = inv_center
+                    # Otherwise, leave entry_value_usd unset so PnL is deferred until proper data exists
+                except Exception:
+                    pass
 
             # If still missing, use current observed amounts and treat any stable side as $1
             if entry_value_usd is None or entry_value_usd <= 0:
@@ -372,6 +391,24 @@ class PositionDatabase:
                         token1_price_usd = 1.0
                     if token0_price_usd is not None and token1_price_usd is not None:
                         entry_value_usd = float(entry_amount0) * float(token0_price_usd) + float(entry_amount1) * float(token1_price_usd)
+                except Exception:
+                    pass
+
+            # New baseline for first-seen entries with stable exposure: if we still don't have
+            # a reliable historical entry, but we do have live token USD prices now, baseline
+            # the entry USD value at first detection. This avoids spurious immediate negative PnL
+            # on brand-new positions, and will be backfilled later if historical data becomes available.
+            if (entry_value_usd is None or entry_value_usd <= 0) and token_prices:
+                try:
+                    from price_utils import is_stablecoin
+                    t0 = status.get('token0_symbol', '')
+                    t1 = status.get('token1_symbol', '')
+                    p0 = token_prices.get(t0)
+                    p1 = token_prices.get(t1)
+                    if p0 is not None and p1 is not None and (is_stablecoin(t0) or is_stablecoin(t1)):
+                        entry_value_usd = float(entry_amount0) * float(p0) + float(entry_amount1) * float(p1)
+                        token0_price_usd = p0
+                        token1_price_usd = p1
                 except Exception:
                     pass
             
@@ -628,6 +665,12 @@ class PositionDatabase:
         
         # Skip PnL calculation for positions that don't have proper entry data yet
         if entry['entry_value_usd'] is None or entry['entry_value_usd'] <= 0:
+            return None
+        
+        # BUGFIX: Additional safeguard against positions with artificially high entry values
+        # If entry value seems unreasonably high compared to current value (>50% higher),
+        # it likely used current prices incorrectly. Skip PnL calculation until fixed.
+        if current_value > 0 and entry_value > current_value * 1.5:
             return None
         
         # Calculate what we would have if we just held the tokens (HODL)
